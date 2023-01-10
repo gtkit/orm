@@ -1,11 +1,10 @@
 // @Author xiaozhaofu 2023/1/10 18:37:00
-package orm
+package mysql
 
 import (
 	"bytes"
 	"fmt"
 
-	"gitlab.superjq.com/go-tools/logger"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -15,23 +14,20 @@ var (
 	gop gorm.Config
 )
 
-// type mysqlconffunc func(opts ...Options)
-// type gormconffunc func(opts ...GormOptions)
-
 func NewMysql() *gorm.DB {
 
 	mydb := new(Mysql)
 	db, err := mydb.Open(mydb.GetConnect())
 
 	if err != nil {
-		logger.Fatalf("%s connect error %v", mop.DbType, err)
+		// logger.Fatalf("%s connect error %v", mop.DbType, err)
 		panic(err)
 	} else {
-		logger.Infof("%s connect success!", mop.DbType)
+		// logger.Infof("%s connect success!", mop.DbType)
 	}
 
 	if db.Error != nil {
-		logger.Fatalf("database error %v", db.Error)
+		// logger.Fatalf("database error %v", db.Error)
 		panic(err)
 	}
 	return db
