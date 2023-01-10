@@ -1,0 +1,78 @@
+// @Author xiaozhaofu 2023/1/10 18:37:00
+package orm
+
+import (
+	"bytes"
+	"fmt"
+
+	"gitlab.superjq.com/go-tools/logger"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+)
+
+var (
+	mop options
+	gop gorm.Config
+)
+
+// type mysqlconffunc func(opts ...Options)
+// type gormconffunc func(opts ...GormOptions)
+
+func NewMysql() *gorm.DB {
+
+	mydb := new(Mysql)
+	db, err := mydb.Open(mydb.GetConnect())
+
+	if err != nil {
+		logger.Fatalf("%s connect error %v", mop.DbType, err)
+		panic(err)
+	} else {
+		logger.Infof("%s connect success!", mop.DbType)
+	}
+
+	if db.Error != nil {
+		logger.Fatalf("database error %v", db.Error)
+		panic(err)
+	}
+	return db
+
+}
+
+type Mysql struct{}
+
+func MysqlConfig(opts ...Options) {
+
+	for _, o := range opts {
+		o.apply(&mop)
+	}
+
+}
+func GormConfig(opts ...GormOptions) {
+
+	for _, o := range opts {
+		o.apply(&gop)
+	}
+
+}
+
+func (e *Mysql) GetConnect() string {
+	var conn bytes.Buffer // bytes.buffer是一个缓冲byte类型的缓冲器存放着都是byte
+	conn.WriteString(mop.Username)
+	conn.WriteString(":")
+	conn.WriteString(mop.Password)
+	conn.WriteString("@tcp(")
+	conn.WriteString(mop.Host)
+	conn.WriteString(":")
+	conn.WriteString(mop.Port)
+	conn.WriteString(")")
+	conn.WriteString("/")
+	conn.WriteString(mop.DbName)
+	conn.WriteString("?charset=utf8&parseTime=True&loc=Local&timeout=10000ms")
+	fmt.Println(conn.String())
+	return conn.String()
+}
+
+func (e *Mysql) Open(conn string) (db *gorm.DB, err error) {
+	return gorm.Open(mysql.Open(conn), &gop)
+
+}
