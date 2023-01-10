@@ -1,5 +1,5 @@
 // @Author xiaozhaofu 2023/1/10 18:37:00
-package mysql
+package orm
 
 import (
 	"bytes"
