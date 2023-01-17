@@ -63,7 +63,7 @@ func (e *Mysql) GetConnect() string {
 	conn.WriteString(")")
 	conn.WriteString("/")
 	conn.WriteString(mop.DbName)
-	conn.WriteString("?charset=utf8&parseTime=True&loc=Local&timeout=10000ms")
+	conn.WriteString("?charset=utf8mb4&parseTime=True&loc=Local&timeout=10000ms")
 	fmt.Println(conn.String())
 	return conn.String()
 }
