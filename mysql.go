@@ -3,7 +3,6 @@ package orm
 
 import (
 	"bytes"
-	"fmt"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -64,7 +63,6 @@ func (e *Mysql) GetConnect() string {
 	conn.WriteString("/")
 	conn.WriteString(mop.DbName)
 	conn.WriteString("?charset=utf8mb4&parseTime=True&loc=Local&timeout=10000ms")
-	fmt.Println(conn.String())
 	return conn.String()
 }
 
