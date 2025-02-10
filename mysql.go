@@ -1,4 +1,3 @@
-// @Author xiaozhaofu 2023/1/10 18:37:00
 package orm
 
 import (
@@ -14,25 +13,23 @@ var (
 )
 
 func NewMysql(setter Setter) *gorm.DB {
-
 	mydb := new(Mysql)
 	db, err := mydb.Open(mydb.GetConnect())
 
 	if err != nil {
 		// logger.Fatalf("%s connect error %v", mop.DbType, err)
 		panic(err)
-	} else {
-		// logger.Infof("%s connect success!", mop.DbType)
 	}
 
 	if db.Error != nil {
 		// logger.Fatalf("database error %v", db.Error)
 		panic(err)
 	}
-	setter.Set(db)
+	if setter != nil {
+		setter.Set(db)
+	}
 
 	return db
-
 }
 
 type Setter interface {
@@ -42,18 +39,14 @@ type Setter interface {
 type Mysql struct{}
 
 func MysqlConfig(opts ...Options) {
-
 	for _, o := range opts {
 		o.apply(&mop)
 	}
-
 }
 func GormConfig(opts ...GormOptions) {
-
 	for _, o := range opts {
 		o.apply(&gop)
 	}
-
 }
 
 func (e *Mysql) GetConnect() string {
