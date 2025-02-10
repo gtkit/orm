@@ -1,4 +1,4 @@
-package orm
+package datatypes
 
 import (
 	"database/sql"
@@ -8,7 +8,7 @@ import (
 
 type Date time.Time
 
-func (date *Date) Scan(value interface{}) (err error) {
+func (date *Date) Scan(value any) (err error) {
 	nullTime := &sql.NullTime{}
 	err = nullTime.Scan(value)
 	*date = Date(nullTime.Time)

@@ -13,7 +13,7 @@ var (
 	gop gorm.Config
 )
 
-func NewMysql() *gorm.DB {
+func NewMysql(setter Setter) *gorm.DB {
 
 	mydb := new(Mysql)
 	db, err := mydb.Open(mydb.GetConnect())
@@ -29,8 +29,14 @@ func NewMysql() *gorm.DB {
 		// logger.Fatalf("database error %v", db.Error)
 		panic(err)
 	}
+	setter.Set(db)
+
 	return db
 
+}
+
+type Setter interface {
+	Set(db *gorm.DB)
 }
 
 type Mysql struct{}
@@ -68,5 +74,4 @@ func (e *Mysql) GetConnect() string {
 
 func (e *Mysql) Open(conn string) (db *gorm.DB, err error) {
 	return gorm.Open(mysql.Open(conn), &gop)
-
 }

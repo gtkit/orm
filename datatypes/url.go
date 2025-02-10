@@ -1,4 +1,4 @@
-package orm
+package datatypes
 
 import (
 	"database/sql/driver"
@@ -18,7 +18,7 @@ func (u URL) Value() (driver.Value, error) {
 	return u.String(), nil
 }
 
-func (u *URL) Scan(value interface{}) error {
+func (u *URL) Scan(value any) error {
 	var us string
 	switch v := value.(type) {
 	case []byte:

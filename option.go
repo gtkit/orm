@@ -91,7 +91,11 @@ func WithPassword(pass string) Options {
 	return password{password: pass}
 }
 
-// Gorm 配制
+/**
+ * Gorm 配置
+ */
+
+// preparestmt 配置是否预编译sql语句.
 type preparestmt struct {
 	preparestmt bool
 }
@@ -104,6 +108,7 @@ func PrepareStmt(prepare bool) GormOptions {
 	return preparestmt{preparestmt: prepare}
 }
 
+// skipdefaulttransaction 配置是否跳过默认事务.
 type skipdefaulttransaction struct {
 	skipdefaulttransaction bool
 }
@@ -115,6 +120,7 @@ func SkipDefaultTransaction(skip bool) GormOptions {
 	return skipdefaulttransaction{skipdefaulttransaction: skip}
 }
 
+// log 配置日志.
 type log struct {
 	logger gormlogger.Interface
 }
@@ -124,4 +130,16 @@ func (l log) apply(conf *gorm.Config) {
 }
 func GormLog(l gormlogger.Interface) GormOptions {
 	return log{logger: l}
+}
+
+// nowfunc 配置自定义now函数.
+type nowfunc struct {
+	nowfunc func() time.Time
+}
+
+func (n nowfunc) apply(conf *gorm.Config) {
+	conf.NowFunc = n.nowfunc
+}
+func NowFunc(f func() time.Time) GormOptions {
+	return nowfunc{nowfunc: f}
 }

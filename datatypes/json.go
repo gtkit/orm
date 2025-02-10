@@ -1,5 +1,4 @@
-// gorm 自定义数据类型 https://github.com/go-gorm/datatypes
-package orm
+package datatypes
 
 import (
 	"context"
@@ -30,7 +29,7 @@ func (j JSON) Value() (driver.Value, error) {
 }
 
 // Scan scan value into Jsonb, implements sql.Scanner interface
-func (j *JSON) Scan(value interface{}) error {
+func (j *JSON) Scan(value any) error {
 	if value == nil {
 		*j = JSON("null")
 		return nil
@@ -111,7 +110,8 @@ type JSONQueryExpression struct {
 	keys        []string
 	hasKeys     bool
 	equals      bool
-	equalsValue interface{}
+	likes       bool
+	equalsValue any
 	extract     bool
 	path        string
 }
@@ -136,9 +136,17 @@ func (jsonQuery *JSONQueryExpression) HasKey(keys ...string) *JSONQueryExpressio
 }
 
 // Keys returns clause.Expression
-func (jsonQuery *JSONQueryExpression) Equals(value interface{}, keys ...string) *JSONQueryExpression {
+func (jsonQuery *JSONQueryExpression) Equals(value any, keys ...string) *JSONQueryExpression {
 	jsonQuery.keys = keys
 	jsonQuery.equals = true
+	jsonQuery.equalsValue = value
+	return jsonQuery
+}
+
+// Likes return clause.Expression
+func (jsonQuery *JSONQueryExpression) Likes(value any, keys ...string) *JSONQueryExpression {
+	jsonQuery.keys = keys
+	jsonQuery.likes = true
 	jsonQuery.equalsValue = value
 	return jsonQuery
 }
@@ -153,7 +161,7 @@ func (jsonQuery *JSONQueryExpression) Build(builder clause.Builder) {
 				builder.WriteString("JSON_EXTRACT(")
 				builder.WriteQuoted(jsonQuery.column)
 				builder.WriteByte(',')
-				builder.AddVar(stmt, jsonQuery.path)
+				builder.AddVar(stmt, prefix+jsonQuery.path)
 				builder.WriteString(")")
 			case jsonQuery.hasKeys:
 				if len(jsonQuery.keys) > 0 {
@@ -176,9 +184,26 @@ func (jsonQuery *JSONQueryExpression) Build(builder clause.Builder) {
 						stmt.AddVar(builder, jsonQuery.equalsValue)
 					}
 				}
+			case jsonQuery.likes:
+				if len(jsonQuery.keys) > 0 {
+					builder.WriteString("JSON_EXTRACT(")
+					builder.WriteQuoted(jsonQuery.column)
+					builder.WriteByte(',')
+					builder.AddVar(stmt, jsonQueryJoin(jsonQuery.keys))
+					builder.WriteString(") LIKE ")
+					if value, ok := jsonQuery.equalsValue.(bool); ok {
+						builder.WriteString(strconv.FormatBool(value))
+					} else {
+						stmt.AddVar(builder, jsonQuery.equalsValue)
+					}
+				}
 			}
 		case "postgres":
 			switch {
+			case jsonQuery.extract:
+				builder.WriteString(fmt.Sprintf("json_extract_path_text(%v::json,", stmt.Quote(jsonQuery.column)))
+				stmt.AddVar(builder, jsonQuery.path)
+				builder.WriteByte(')')
 			case jsonQuery.hasKeys:
 				if len(jsonQuery.keys) > 0 {
 					stmt.WriteQuoted(jsonQuery.column)
@@ -202,6 +227,24 @@ func (jsonQuery *JSONQueryExpression) Build(builder clause.Builder) {
 						stmt.AddVar(builder, key)
 					}
 					builder.WriteString(") = ")
+
+					if _, ok := jsonQuery.equalsValue.(string); ok {
+						stmt.AddVar(builder, jsonQuery.equalsValue)
+					} else {
+						stmt.AddVar(builder, fmt.Sprint(jsonQuery.equalsValue))
+					}
+				}
+			case jsonQuery.likes:
+				if len(jsonQuery.keys) > 0 {
+					builder.WriteString(fmt.Sprintf("json_extract_path_text(%v::json,", stmt.Quote(jsonQuery.column)))
+
+					for idx, key := range jsonQuery.keys {
+						if idx > 0 {
+							builder.WriteByte(',')
+						}
+						stmt.AddVar(builder, key)
+					}
+					builder.WriteString(") LIKE ")
 
 					if _, ok := jsonQuery.equalsValue.(string); ok {
 						stmt.AddVar(builder, jsonQuery.equalsValue)
@@ -285,17 +328,30 @@ func jsonQueryJoin(keys []string) string {
 // JSONSetExpression json set expression, implements clause.Expression interface to use as updater
 type JSONSetExpression struct {
 	column     string
-	path2value map[string]interface{}
+	path2value map[string]any
 	mutex      sync.RWMutex
 }
 
 // JSONSet update fields of json column
 func JSONSet(column string) *JSONSetExpression {
-	return &JSONSetExpression{column: column, path2value: make(map[string]interface{})}
+	return &JSONSetExpression{column: column, path2value: make(map[string]any)}
 }
 
-// Set return clause.Expression
-func (jsonSet *JSONSetExpression) Set(path string, value interface{}) *JSONSetExpression {
+// Set return clause.Expression.
+//
+//	{
+//		"age": 20,
+//		"name": "json-1",
+//		"orgs": {"orga": "orgv"},
+//		"tags": ["tag1", "tag2"]
+//	}
+//
+//	// In MySQL/SQLite, path is `age`, `name`, `orgs.orga`, `tags[0]`, `tags[1]`.
+//	DB.UpdateColumn("attr", JSONSet("attr").Set("orgs.orga", 42))
+//
+//	// In PostgreSQL, path is `{age}`, `{name}`, `{orgs,orga}`, `{tags, 0}`, `{tags, 1}`.
+//	DB.UpdateColumn("attr", JSONSet("attr").Set("{orgs, orga}", "bar"))
+func (jsonSet *JSONSetExpression) Set(path string, value any) *JSONSetExpression {
 	jsonSet.mutex.Lock()
 	jsonSet.path2value[path] = value
 	jsonSet.mutex.Unlock()
@@ -303,7 +359,7 @@ func (jsonSet *JSONSetExpression) Set(path string, value interface{}) *JSONSetEx
 }
 
 // Build implements clause.Expression
-// only support mysql and sqlite
+// support mysql, sqlite and postgres
 func (jsonSet *JSONSetExpression) Build(builder clause.Builder) {
 	if stmt, ok := builder.(*gorm.Statement); ok {
 		switch stmt.Dialector.Name() {
@@ -370,6 +426,137 @@ func (jsonSet *JSONSetExpression) Build(builder clause.Builder) {
 				}
 			}
 			builder.WriteString(")")
+
+		case "postgres":
+			var expr clause.Expression = columnExpression(jsonSet.column)
+			for path, value := range jsonSet.path2value {
+				if _, ok = value.(clause.Expression); ok {
+					expr = gorm.Expr("JSONB_SET(?,?,?)", expr, path, value)
+					continue
+				} else {
+					b, _ := json.Marshal(value)
+					expr = gorm.Expr("JSONB_SET(?,?,?)", expr, path, string(b))
+				}
+			}
+			stmt.AddVar(builder, expr)
+		}
+	}
+}
+
+func JSONArrayQuery(column string) *JSONArrayExpression {
+	return &JSONArrayExpression{
+		column: column,
+	}
+}
+
+type JSONArrayExpression struct {
+	contains    bool
+	in          bool
+	column      string
+	keys        []string
+	equalsValue any
+}
+
+// Contains checks if column[keys] contains the value given. The keys parameter is only supported for MySQL and SQLite.
+func (json *JSONArrayExpression) Contains(value any, keys ...string) *JSONArrayExpression {
+	json.contains = true
+	json.equalsValue = value
+	json.keys = keys
+	return json
+}
+
+// In checks if columns[keys] is in the array value given. This method is only supported for MySQL and SQLite.
+func (json *JSONArrayExpression) In(value any, keys ...string) *JSONArrayExpression {
+	json.in = true
+	json.keys = keys
+	json.equalsValue = value
+	return json
+}
+
+// Build implements clause.Expression
+func (json *JSONArrayExpression) Build(builder clause.Builder) {
+	if stmt, ok := builder.(*gorm.Statement); ok {
+		switch stmt.Dialector.Name() {
+		case "mysql":
+			switch {
+			case json.contains:
+				builder.WriteString("JSON_CONTAINS(" + stmt.Quote(json.column) + ",JSON_ARRAY(")
+				builder.AddVar(stmt, json.equalsValue)
+				builder.WriteByte(')')
+				if len(json.keys) > 0 {
+					builder.WriteByte(',')
+					builder.AddVar(stmt, jsonQueryJoin(json.keys))
+				}
+				builder.WriteByte(')')
+			case json.in:
+				builder.WriteString("JSON_CONTAINS(JSON_ARRAY")
+				builder.AddVar(stmt, json.equalsValue)
+				builder.WriteByte(',')
+				if len(json.keys) > 0 {
+					builder.WriteString("JSON_EXTRACT(")
+				}
+				builder.WriteQuoted(json.column)
+				if len(json.keys) > 0 {
+					builder.WriteByte(',')
+					builder.AddVar(stmt, jsonQueryJoin(json.keys))
+					builder.WriteByte(')')
+				}
+				builder.WriteByte(')')
+			}
+		case "sqlite":
+			switch {
+			case json.contains:
+				builder.WriteString("EXISTS(SELECT 1 FROM json_each(")
+				builder.WriteQuoted(json.column)
+				if len(json.keys) > 0 {
+					builder.WriteByte(',')
+					builder.AddVar(stmt, jsonQueryJoin(json.keys))
+				}
+				builder.WriteString(") WHERE value = ")
+				builder.AddVar(stmt, json.equalsValue)
+				builder.WriteString(") AND json_array_length(")
+				builder.WriteQuoted(json.column)
+				if len(json.keys) > 0 {
+					builder.WriteByte(',')
+					builder.AddVar(stmt, jsonQueryJoin(json.keys))
+				}
+				builder.WriteString(") > 0")
+			case json.in:
+				builder.WriteString("CASE WHEN json_type(")
+				builder.WriteQuoted(json.column)
+				if len(json.keys) > 0 {
+					builder.WriteByte(',')
+					builder.AddVar(stmt, jsonQueryJoin(json.keys))
+				}
+				builder.WriteString(") = 'array' THEN NOT EXISTS(SELECT 1 FROM json_each(")
+				builder.WriteQuoted(json.column)
+				if len(json.keys) > 0 {
+					builder.WriteByte(',')
+					builder.AddVar(stmt, jsonQueryJoin(json.keys))
+				}
+				builder.WriteString(") WHERE value NOT IN ")
+				builder.AddVar(stmt, json.equalsValue)
+				builder.WriteString(") ELSE ")
+				if len(json.keys) > 0 {
+					builder.WriteString("json_extract(")
+				}
+				builder.WriteQuoted(json.column)
+				if len(json.keys) > 0 {
+					builder.WriteByte(',')
+					builder.AddVar(stmt, jsonQueryJoin(json.keys))
+					builder.WriteByte(')')
+				}
+				builder.WriteString(" IN ")
+				builder.AddVar(stmt, json.equalsValue)
+				builder.WriteString(" END")
+			}
+		case "postgres":
+			switch {
+			case json.contains:
+				builder.WriteString(stmt.Quote(json.column))
+				builder.WriteString(" ? ")
+				builder.AddVar(stmt, json.equalsValue)
+			}
 		}
 	}
 }
