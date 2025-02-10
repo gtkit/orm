@@ -12,7 +12,7 @@ var (
 	gop gorm.Config
 )
 
-func NewMysql(setter Setter) *gorm.DB {
+func NewMysql(setter ...Setter) *gorm.DB {
 	mydb := new(Mysql)
 	db, err := mydb.Open(mydb.GetConnect())
 
@@ -25,8 +25,9 @@ func NewMysql(setter Setter) *gorm.DB {
 		// logger.Fatalf("database error %v", db.Error)
 		panic(err)
 	}
-	if setter != nil {
-		setter.Set(db)
+	// 自定义配置
+	if len(setter) > 0 && setter[0] != nil {
+		setter[0].Set(db)
 	}
 
 	return db
