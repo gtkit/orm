@@ -3,9 +3,6 @@ package orm
 
 import (
 	"time"
-
-	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 )
 
 type options struct {
@@ -22,9 +19,7 @@ type options struct {
 type Options interface {
 	apply(*options)
 }
-type GormOptions interface {
-	apply(config *gorm.Config)
-}
+
 type dbtype struct {
 	dbtype string
 }
@@ -32,6 +27,8 @@ type dbtype struct {
 func (db dbtype) apply(opt *options) {
 	opt.DbType = opt.DbType
 }
+
+// 数据库类型配置.
 func DbType(t string) Options {
 	return dbtype{dbtype: t}
 }
@@ -43,6 +40,8 @@ type host struct {
 func (h host) apply(opt *options) {
 	opt.Host = h.host
 }
+
+// 数据库链接地址配置.
 func Host(h string) Options {
 	return host{host: h}
 }
@@ -54,6 +53,8 @@ type port struct {
 func (p port) apply(opt *options) {
 	opt.Port = p.port
 }
+
+// 数据库端口配置.
 func Port(p string) Options {
 	return port{port: p}
 }
@@ -65,6 +66,8 @@ type name struct {
 func (n name) apply(opt *options) {
 	opt.DbName = n.name
 }
+
+// 数据库名称配置.
 func Name(n string) Options {
 	return name{name: n}
 }
@@ -76,6 +79,8 @@ type username struct {
 func (u username) apply(opt *options) {
 	opt.Username = u.username
 }
+
+// 登录用户名配置.
 func User(u string) Options {
 	return username{username: u}
 }
@@ -87,59 +92,8 @@ type password struct {
 func (p password) apply(opt *options) {
 	opt.Password = p.password
 }
+
+// 登录密码配置.
 func WithPassword(pass string) Options {
 	return password{password: pass}
-}
-
-/**
- * Gorm 配置
- */
-
-// preparestmt 配置是否预编译sql语句.
-type preparestmt struct {
-	preparestmt bool
-}
-
-func (p preparestmt) apply(conf *gorm.Config) {
-	conf.PrepareStmt = p.preparestmt
-}
-
-func PrepareStmt(prepare bool) GormOptions {
-	return preparestmt{preparestmt: prepare}
-}
-
-// skipdefaulttransaction 配置是否跳过默认事务.
-type skipdefaulttransaction struct {
-	skipdefaulttransaction bool
-}
-
-func (s skipdefaulttransaction) apply(conf *gorm.Config) {
-	conf.SkipDefaultTransaction = s.skipdefaulttransaction
-}
-func SkipDefaultTransaction(skip bool) GormOptions {
-	return skipdefaulttransaction{skipdefaulttransaction: skip}
-}
-
-// log 配置日志.
-type log struct {
-	logger gormlogger.Interface
-}
-
-func (l log) apply(conf *gorm.Config) {
-	conf.Logger = l.logger
-}
-func GormLog(l gormlogger.Interface) GormOptions {
-	return log{logger: l}
-}
-
-// nowfunc 配置自定义now函数.
-type nowfunc struct {
-	nowfunc func() time.Time
-}
-
-func (n nowfunc) apply(conf *gorm.Config) {
-	conf.NowFunc = n.nowfunc
-}
-func NowFunc(f func() time.Time) GormOptions {
-	return nowfunc{nowfunc: f}
 }

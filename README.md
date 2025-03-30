@@ -5,17 +5,20 @@
 ```go
 var mdb *gorm.DB
 orm.MysqlConfig(
-		orm.Host("127.0.0.1"),
-		orm.Port("3306"),
-		orm.DbType("mysql"),
-		orm.Name("office_aid"),
-		orm.User("root"),
+		orm.Host("127.0.0.1"), // 数据库地址
+		orm.Port("3306"), // 数据库端口
+		orm.DbType("mysql"), // 数据库类型
+		orm.Name("office_aid"), // 数据库名称
+		orm.User("root"), // 数据库用户名
+		orm.WithPassword("root123"), // 数据库密码
 	)
 orm.GormConfig(
-		orm.PrepareStmt(true),
-		orm.SkipDefaultTransaction(true),
+		orm.PrepareStmt(true), // 是否预编译SQL语句
+		orm.SkipDefaultTransaction(true), // 是否跳过默认事务
 		orm.GormLog(gormlog.New(logger.Zlog())), // 此处注意,日志需要先实例化
-                orm.NowFunc(f func() time.Time)
+                orm.NowFunc(f func() time.Time), // 此处注意,自定义now时间函数
+                orm.SingularTable(true), // 表名不加复数
+                orm.TablePrefix("t_"), // 表名前缀
 	)
 
 mdb = orm.NewMysql() // 实例化数据库连接, 并返回*gorm.DB, 可配置实现 setter 接口

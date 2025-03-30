@@ -48,6 +48,7 @@ func GormConfig(opts ...GormOptions) {
 	for _, o := range opts {
 		o.apply(&gop)
 	}
+	gop.NamingStrategy = gormNamingStrategy
 }
 
 func (e *Mysql) GetConnect() string {
