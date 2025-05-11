@@ -40,6 +40,13 @@ type Setter interface {
 type Mysql struct{}
 
 func MysqlConfig(opts ...Options) {
+	mop = options{
+		DbType:   "mysql",
+		Username: "root",
+		Password: "",
+		Host:     "127.0.0.1",
+		Port:     "3306",
+	}
 	for _, o := range opts {
 		o.apply(&mop)
 	}
