@@ -1,12 +1,12 @@
 module github.com/gtkit/orm
 
-go 1.24
+go 1.25
 
 require (
 	github.com/gtkit/logger v1.3.0
-	go.uber.org/zap v1.27.0
+	go.uber.org/zap v1.27.1
 	gorm.io/driver/mysql v1.6.0
-	gorm.io/gorm v1.30.1
+	gorm.io/gorm v1.31.1
 )
 
 require (
@@ -20,5 +20,5 @@ require (
 	github.com/natefinch/lumberjack v2.0.0+incompatible // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/text v0.27.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
 )
