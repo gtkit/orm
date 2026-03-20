@@ -5,23 +5,36 @@
 ```go
 var mdb *gorm.DB
 orm.MysqlConfig(
-		orm.Host("127.0.0.1"), // 数据库地址
-		orm.Port("3306"), // 数据库端口
-		orm.DbType("mysql"), // 数据库类型
-		orm.Name("office_aid"), // 数据库名称
-		orm.User("root"), // 数据库用户名
-		orm.WithPassword("root123"), // 数据库密码
-	)
+	orm.Host("127.0.0.1"),               // 数据库地址
+	orm.Port("3306"),                    // 数据库端口
+	orm.DbType("mysql"),                 // 数据库类型
+	orm.Name("office_aid"),              // 数据库名称
+	orm.User("root"),                    // 数据库用户名
+	orm.WithPassword("root123"),         // 数据库密码
+	orm.MaxOpenConns(50),                // 最大打开连接数
+	orm.MaxIdleConns(10),                // 最大空闲连接数
+	orm.ConnMaxLifetime(30*time.Minute), // 连接最大存活时间
+	orm.ConnMaxIdleTime(10*time.Minute), // 连接最大空闲时间
+)
 orm.GormConfig(
-		orm.PrepareStmt(true), // 是否预编译SQL语句
-		orm.SkipDefaultTransaction(true), // 是否跳过默认事务
-		orm.GormLog(gormlog.New(logger.Zlog())), // 此处注意,日志需要先实例化
-                orm.NowFunc(f func() time.Time), // 此处注意,自定义now时间函数
-                orm.SingularTable(true), // 表名不加复数
-                orm.TablePrefix("t_"), // 表名前缀
-	)
+	orm.PrepareStmt(true),                 // 是否预编译 SQL 语句
+	orm.SkipDefaultTransaction(true),      // 是否跳过默认事务
+	orm.GormLog(gormlog.New(logger.Zlog())), // 此处注意,日志需要先实例化
+	orm.NowFunc(f func() time.Time),       // 此处注意,自定义 now 时间函数
+	orm.SingularTable(true),               // 表名不加复数
+	orm.TablePrefix("t_"),                 // 表名前缀
+)
 
-mdb = orm.NewMysql() // 实例化数据库连接, 并返回*gorm.DB, 可配置实现 setter 接口
+// 推荐: 返回 error 由业务自行处理
+mdb, err = orm.OpenMysql()
+if err != nil {
+	panic(err)
+}
+
+// 兼容旧用法: 出错直接 panic
+// mdb = orm.NewMysql()
+
+// 可继续使用 setter 做额外自定义
 // mdb = orm.NewMysql(&DBSet{})
 ```
 

@@ -20,7 +20,7 @@ func (p preparestmt) apply(conf *gorm.Config) {
 	conf.PrepareStmt = p.preparestmt
 }
 
-// preparestmt 配置是否预编译sql语句.
+// PrepareStmt preparestmt 配置是否预编译sql语句.
 func PrepareStmt(prepare bool) GormOptions {
 	return preparestmt{preparestmt: prepare}
 }
@@ -33,7 +33,7 @@ func (s skipdefaulttransaction) apply(conf *gorm.Config) {
 	conf.SkipDefaultTransaction = s.skipdefaulttransaction
 }
 
-// skipdefaulttransaction 配置是否跳过默认事务.
+// SkipDefaultTransaction skipdefaulttransaction 配置是否跳过默认事务.
 func SkipDefaultTransaction(skip bool) GormOptions {
 	return skipdefaulttransaction{skipdefaulttransaction: skip}
 }
@@ -46,7 +46,7 @@ func (l log) apply(conf *gorm.Config) {
 	conf.Logger = l.logger
 }
 
-// log 配置日志.
+// GormLog log 配置日志.
 func GormLog(l gormlogger.Interface) GormOptions {
 	return log{logger: l}
 }
@@ -59,28 +59,53 @@ func (n nowfunc) apply(conf *gorm.Config) {
 	conf.NowFunc = n.nowfunc
 }
 
-// nowfunc 配置自定义now函数.
+// NowFunc nowfunc 配置自定义now函数.
 func NowFunc(f func() time.Time) GormOptions {
 	return nowfunc{nowfunc: f}
 }
 
-var gormNamingStrategy = schema.NamingStrategy{
-	TablePrefix:         "",
-	SingularTable:       false,
-	NameReplacer:        nil,
-	NoLowerCase:         false,
-	IdentifierMaxLength: 64,
+func defaultNamingStrategy() schema.NamingStrategy {
+	return schema.NamingStrategy{
+		TablePrefix:         "",
+		SingularTable:       false,
+		NameReplacer:        nil,
+		NoLowerCase:         false,
+		IdentifierMaxLength: 64,
+	}
+}
+
+func defaultGormConfig() gorm.Config {
+	return gorm.Config{
+		NamingStrategy: defaultNamingStrategy(),
+	}
+}
+
+func currentNamingStrategy(conf *gorm.Config) schema.NamingStrategy {
+	if conf == nil {
+		return defaultNamingStrategy()
+	}
+	switch ns := conf.NamingStrategy.(type) {
+	case schema.NamingStrategy:
+		return ns
+	case *schema.NamingStrategy:
+		if ns != nil {
+			return *ns
+		}
+	}
+	return defaultNamingStrategy()
 }
 
 type tablePrefix struct {
 	tablePrefix string
 }
 
-func (t tablePrefix) apply(*gorm.Config) {
-	gormNamingStrategy.TablePrefix = t.tablePrefix
+func (t tablePrefix) apply(conf *gorm.Config) {
+	strategy := currentNamingStrategy(conf)
+	strategy.TablePrefix = t.tablePrefix
+	conf.NamingStrategy = strategy
 }
 
-// tablePrefix 配置表名前缀.
+// TablePrefix tablePrefix 配置表名前缀.
 func TablePrefix(prefix string) GormOptions {
 	return tablePrefix{tablePrefix: prefix}
 }
@@ -89,11 +114,13 @@ type singularTable struct {
 	singularTable bool
 }
 
-func (s singularTable) apply(*gorm.Config) {
-	gormNamingStrategy.SingularTable = s.singularTable
+func (s singularTable) apply(conf *gorm.Config) {
+	strategy := currentNamingStrategy(conf)
+	strategy.SingularTable = s.singularTable
+	conf.NamingStrategy = strategy
 }
 
-// singularTable 配置是否使用单数表名.
+// SingularTable singularTable 配置是否使用单数表名.
 func SingularTable(singular bool) GormOptions {
 	return singularTable{singularTable: singular}
 }
