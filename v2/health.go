@@ -3,6 +3,7 @@ package orm
 import (
 	"context"
 	"database/sql"
+	"maps"
 	"time"
 )
 
@@ -156,9 +157,5 @@ func metricLabels(name string, role NodeRole) map[string]string {
 }
 
 func cloneLabels(src map[string]string) map[string]string {
-	dst := make(map[string]string, len(src))
-	for key, value := range src {
-		dst[key] = value
-	}
-	return dst
+	return maps.Clone(src)
 }

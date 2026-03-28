@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"maps"
 	"net"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 )
 
 const defaultDialTimeout = 10 * time.Second
+const defaultIdentifierMaxLength = 64
 
 var (
 	errNilSQLDB       = errors.New("orm/v2: nil *sql.DB")
@@ -30,6 +32,9 @@ type Config struct {
 	StartupPing bool
 }
 
+// MySQLConfig describes driver-level connection settings.
+// Addr takes precedence over Host and Port when both are set.
+// Prefer the Option helpers so Addr/Host/Port precedence stays consistent.
 type MySQLConfig struct {
 	User                 string
 	Password             string
@@ -168,6 +173,9 @@ func (c Config) MustOpen(ctx context.Context) *Client {
 	return client
 }
 
+// OpenWithDB wraps an existing *sql.DB.
+// Pool settings from Config.Pool are applied to sqlDB before GORM initialization.
+// The caller retains ownership of sqlDB regardless of success or failure.
 func (c Config) OpenWithDB(ctx context.Context, sqlDB *sql.DB) (*Client, error) {
 	if sqlDB == nil {
 		return nil, errNilSQLDB
@@ -183,6 +191,9 @@ func MustOpen(ctx context.Context, opts ...Option) *Client {
 	return NewConfig(opts...).MustOpen(ctx)
 }
 
+// OpenWithDB wraps an existing *sql.DB.
+// Pool settings from the supplied options are applied to sqlDB before GORM initialization.
+// The caller retains ownership of sqlDB regardless of success or failure.
 func OpenWithDB(ctx context.Context, sqlDB *sql.DB, opts ...Option) (*Client, error) {
 	return NewConfig(opts...).OpenWithDB(ctx, sqlDB)
 }
@@ -227,7 +238,12 @@ func (c Config) RedactedDSN() (string, error) {
 	return driverCfg.FormatDSN(), nil
 }
 
-func (c Config) openWithSQLDB(ctx context.Context, sqlDB *sql.DB, ownsSQLDB bool, driverCfg *mysqldriver.Config) (*Client, error) {
+func (c Config) openWithSQLDB(
+	ctx context.Context,
+	sqlDB *sql.DB,
+	ownsSQLDB bool,
+	driverCfg *mysqldriver.Config,
+) (*Client, error) {
 	clone := c.Clone()
 	applyPoolConfig(sqlDB, clone.Pool)
 
@@ -321,7 +337,7 @@ func applyPoolConfig(sqlDB *sql.DB, pool PoolConfig) {
 
 func defaultNamingStrategy() schema.NamingStrategy {
 	return schema.NamingStrategy{
-		IdentifierMaxLength: 64,
+		IdentifierMaxLength: defaultIdentifierMaxLength,
 	}
 }
 
@@ -333,15 +349,7 @@ func normalizeContext(ctx context.Context) context.Context {
 }
 
 func cloneStringMap(src map[string]string) map[string]string {
-	if src == nil {
-		return nil
-	}
-
-	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
+	return maps.Clone(src)
 }
 
 func (c MySQLConfig) address() (string, error) {

@@ -3,25 +3,22 @@ package zlogger
 import (
 	"context"
 	"errors"
-	"fmt"
-	"path/filepath"
-	"runtime"
-	"strings"
 	"time"
 
-	"github.com/gtkit/logger"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
+	"gorm.io/gorm/utils"
 )
 
 const slowTime = 200 * time.Millisecond
 
 type GormLogger struct {
-	ZapLogger     *zap.Logger
-	SlowThreshold time.Duration
-	sqlLog        bool
-	ignoreTrace   bool
+	zapLogger                 *zap.Logger
+	slowThreshold             time.Duration
+	logLevel                  gormlogger.LogLevel
+	ignoreRecordNotFoundError bool
+	parameterizedQueries      bool
 }
 
 func _() {
@@ -29,90 +26,89 @@ func _() {
 }
 
 func New(options ...Option) gormlogger.Interface {
-	l := GormLogger{
-		SlowThreshold: slowTime,
+	logger := &GormLogger{
+		zapLogger:     zap.NewNop(),
+		slowThreshold: slowTime,
+		logLevel:      gormlogger.Warn,
 	}
 	for _, option := range options {
-		option(&l)
+		if option != nil {
+			option(logger)
+		}
 	}
-	if l.ZapLogger == nil {
-		logger.NewZap(logger.WithFile(true), logger.WithConsole(true))
-		logger.ZInfo("**** gorm new zap logger ****")
-		l.ZapLogger = logger.Zlog()
+	return logger
+}
+
+func (l *GormLogger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
+	clone := *l
+	clone.logLevel = level
+	return &clone
+}
+
+func (l *GormLogger) Info(_ context.Context, msg string, data ...any) {
+	if l.logLevel < gormlogger.Info {
+		return
 	}
-
-	return l
+	l.sugar().Infof(msg, data...)
 }
 
-func (l GormLogger) LogMode(_ gormlogger.LogLevel) gormlogger.Interface {
-	return l
+func (l *GormLogger) Warn(_ context.Context, msg string, data ...any) {
+	if l.logLevel < gormlogger.Warn {
+		return
+	}
+	l.sugar().Warnf(msg, data...)
 }
 
-func (l GormLogger) Info(_ context.Context, s string, i ...any) {
-	l.sugar().Debugf(s, i...)
+func (l *GormLogger) Error(_ context.Context, msg string, data ...any) {
+	if l.logLevel < gormlogger.Error {
+		return
+	}
+	l.sugar().Errorf(msg, data...)
 }
 
-func (l GormLogger) Warn(_ context.Context, s string, i ...any) {
-	l.sugar().Warnf(s, i...)
-}
-
-func (l GormLogger) Error(_ context.Context, s string, i ...any) {
-	l.sugar().Errorf(s, i...)
-}
-
-func (l GormLogger) Trace(_ context.Context, begin time.Time, fc func() (sql string, rowsAffected int64), err error) {
-	if l.ignoreTrace {
+func (l *GormLogger) Trace(_ context.Context, begin time.Time, fc func() (sql string, rowsAffected int64), err error) {
+	if l.logLevel <= gormlogger.Silent {
 		return
 	}
 
 	elapsed := time.Since(begin)
 	sql, rows := fc()
 
-	logFields := []zap.Field{
+	fields := []zap.Field{
+		zap.String("source", utils.FileWithLineNum()),
+		zap.Duration("elapsed", elapsed),
 		zap.String("sql", sql),
-		zap.String("time", fmt.Sprintf("%.3fms", float64(elapsed)/float64(time.Millisecond))),
-		zap.Int64("rows", rows),
 	}
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			l.logger().Warn("Database ErrRecordNotFound", logFields...)
-		} else {
-			logFields = append(logFields, zap.Error(err))
-			l.logger().Error("Database Error", logFields...)
-		}
+	if rows >= 0 {
+		fields = append(fields, zap.Int64("rows", rows))
 	}
 
-	if l.SlowThreshold != 0 && elapsed > l.SlowThreshold {
-		l.logger().Warn("Database Slow Log", logFields...)
-	}
+	recordNotFoundIgnored := errors.Is(err, gorm.ErrRecordNotFound) && l.ignoreRecordNotFoundError
 
-	if l.sqlLog {
-		l.logger().Debug("Database Query", logFields...)
+	switch {
+	case err != nil && l.logLevel >= gormlogger.Error && !recordNotFoundIgnored:
+		l.base().Error("gorm query error", append(fields, zap.Error(err))...)
+	case l.slowThreshold != 0 && elapsed > l.slowThreshold && l.logLevel >= gormlogger.Warn:
+		l.base().Warn("gorm slow query", append(fields, zap.Duration("slow_threshold", l.slowThreshold))...)
+	case l.logLevel == gormlogger.Info:
+		l.base().Info("gorm query", fields...)
 	}
 }
 
-func (l GormLogger) logger() *zap.Logger {
-	var (
-		gormPackage    = filepath.Join("gorm.io", "gorm")
-		zapgormPackage = filepath.Join("moul.io", "zapgorm2")
-	)
-
-	clone := l.ZapLogger.WithOptions(zap.AddCallerSkip(-2))
-
-	for i := 2; i < 15; i++ {
-		_, file, _, ok := runtime.Caller(i)
-		switch {
-		case !ok:
-		case strings.HasSuffix(file, "_test.go"):
-		case strings.Contains(file, gormPackage):
-		case strings.Contains(file, zapgormPackage):
-		default:
-			return clone.WithOptions(zap.AddCallerSkip(i))
-		}
+func (l *GormLogger) ParamsFilter(_ context.Context, sql string, params ...interface{}) (string, []interface{}) {
+	if l.parameterizedQueries {
+		return sql, nil
 	}
-	return l.ZapLogger
+	return sql, params
 }
 
-func (l GormLogger) sugar() *zap.SugaredLogger {
-	return l.logger().Sugar()
+func (l *GormLogger) base() *zap.Logger {
+	if l == nil || l.zapLogger == nil {
+		return zap.NewNop()
+	}
+	return l.zapLogger
+}
+
+func (l *GormLogger) sugar() *zap.SugaredLogger {
+	return l.base().Sugar()
 }

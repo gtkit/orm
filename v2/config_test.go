@@ -102,12 +102,12 @@ func TestOpenWithDBUsesExternalPool(t *testing.T) {
 		t.Fatalf("expected startup ping once, got %d", got)
 	}
 
-	if err := client.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	if closeErr := client.Close(); closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
 	}
 
-	if err := sqlDB.PingContext(context.Background()); err != nil {
-		t.Fatalf("expected external sql.DB to remain open, got %v", err)
+	if pingErr := sqlDB.PingContext(context.Background()); pingErr != nil {
+		t.Fatalf("expected external sql.DB to remain open, got %v", pingErr)
 	}
 	if got := state.pingCount.Load(); got != 2 {
 		t.Fatalf("expected ping count 2 after manual ping, got %d", got)

@@ -9,6 +9,7 @@ import (
 
 type stubDBState struct {
 	pingErr       error
+	pingHook      func()
 	beginErr      error
 	commitErr     error
 	rollbackErr   error
@@ -27,21 +28,9 @@ func withStubPingError(err error) stubDBOption {
 	}
 }
 
-func withStubBeginError(err error) stubDBOption {
+func withStubPingHook(hook func()) stubDBOption {
 	return func(state *stubDBState) {
-		state.beginErr = err
-	}
-}
-
-func withStubCommitError(err error) stubDBOption {
-	return func(state *stubDBState) {
-		state.commitErr = err
-	}
-}
-
-func withStubRollbackError(err error) stubDBOption {
-	return func(state *stubDBState) {
-		state.rollbackErr = err
+		state.pingHook = hook
 	}
 }
 
@@ -105,6 +94,9 @@ func (c *stubConn) BeginTx(_ context.Context, opts driver.TxOptions) (driver.Tx,
 func (c *stubConn) Ping(context.Context) error {
 	if c.state != nil {
 		c.state.pingCount.Add(1)
+		if c.state.pingHook != nil {
+			c.state.pingHook()
+		}
 	}
 	if c.state != nil && c.state.pingErr != nil {
 		return c.state.pingErr

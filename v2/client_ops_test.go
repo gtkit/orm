@@ -25,13 +25,13 @@ func TestClientWithTxCommitAndRollback(t *testing.T) {
 		t.Fatalf("OpenWithDB() error = %v", err)
 	}
 
-	if err := client.WithTx(context.Background(), nil, func(tx *gorm.DB) error {
+	if txErr := client.WithTx(context.Background(), nil, func(tx *gorm.DB) error {
 		if tx == nil {
 			t.Fatalf("expected tx db")
 		}
 		return nil
-	}); err != nil {
-		t.Fatalf("WithTx() error = %v", err)
+	}); txErr != nil {
+		t.Fatalf("WithTx() error = %v", txErr)
 	}
 
 	if got := state.beginCount.Load(); got != 1 {

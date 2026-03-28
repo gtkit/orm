@@ -34,6 +34,8 @@ func (c *Client) WithTx(ctx context.Context, opts *sql.TxOptions, fn func(tx *go
 	}()
 
 	if err = fn(tx); err != nil {
+		// errors.Join(err, nil) == err, so callers can still use errors.Is/As
+		// on the original business error when rollback succeeds.
 		return errors.Join(err, rollbackError(tx))
 	}
 

@@ -6,9 +6,12 @@ import (
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
+	"gorm.io/gorm"
 )
 
 func TestMysqlConfigBuildsDriverDSN(t *testing.T) {
+	resetLegacyConfig(t)
+
 	MysqlConfig(
 		DbType("mariadb"),
 		Host("db.internal"),
@@ -75,6 +78,8 @@ func TestMysqlConfigBuildsDriverDSN(t *testing.T) {
 }
 
 func TestGormConfigResetsToDefaults(t *testing.T) {
+	resetLegacyConfig(t)
+
 	GormConfig(
 		PrepareStmt(true),
 		SkipDefaultTransaction(true),
@@ -115,4 +120,72 @@ func TestGormConfigResetsToDefaults(t *testing.T) {
 	if strategy.SingularTable {
 		t.Fatalf("expected singular table to reset to false")
 	}
+}
+
+func TestMysqlConfigIgnoresNilOptions(t *testing.T) {
+	resetLegacyConfig(t)
+
+	var nilOption Options
+
+	MysqlConfig(
+		nilOption,
+		Host("db.internal"),
+	)
+
+	opts := mysqlOptionsSnapshot()
+	if opts.Host != "db.internal" {
+		t.Fatalf("expected host db.internal, got %q", opts.Host)
+	}
+}
+
+func TestGormConfigIgnoresNilOptions(t *testing.T) {
+	resetLegacyConfig(t)
+
+	var nilOption GormOptions
+
+	GormConfig(
+		nilOption,
+		TablePrefix("t_"),
+	)
+
+	cfg := gormConfigSnapshot()
+	if strategy := currentNamingStrategy(&cfg); strategy.TablePrefix != "t_" {
+		t.Fatalf("expected table prefix t_, got %q", strategy.TablePrefix)
+	}
+}
+
+func TestApplySettersRunsAllAndSkipsNil(t *testing.T) {
+	resetLegacyConfig(t)
+
+	calls := make([]string, 0, 2)
+
+	applySetters(
+		nil,
+		[]Setter{
+			testSetter(func(*gorm.DB) { calls = append(calls, "first") }),
+			nil,
+			testSetter(func(*gorm.DB) { calls = append(calls, "second") }),
+		},
+	)
+
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 setters to run, got %d", len(calls))
+	}
+	if calls[0] != "first" || calls[1] != "second" {
+		t.Fatalf("unexpected setter call order: %#v", calls)
+	}
+}
+
+type testSetter func(*gorm.DB)
+
+func (s testSetter) Set(db *gorm.DB) {
+	s(db)
+}
+
+func resetLegacyConfig(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		MysqlConfig()
+		GormConfig()
+	})
 }

@@ -8,6 +8,8 @@ import (
 	"gorm.io/gorm/schema"
 )
 
+const defaultIdentifierMaxLength = 64
+
 type GormOptions interface {
 	apply(config *gorm.Config)
 }
@@ -70,7 +72,7 @@ func defaultNamingStrategy() schema.NamingStrategy {
 		SingularTable:       false,
 		NameReplacer:        nil,
 		NoLowerCase:         false,
-		IdentifierMaxLength: 64,
+		IdentifierMaxLength: defaultIdentifierMaxLength,
 	}
 }
 

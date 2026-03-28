@@ -18,21 +18,12 @@ var (
 	errReplicaNotFound    = errors.New("orm/v2: replica not found")
 	errNoReadableNode     = errors.New("orm/v2: no readable node available")
 	errPrimaryUnavailable = errors.New("orm/v2: primary unavailable")
-	errNoFailoverTarget   = errors.New("orm/v2: no replica available for failover")
 	errDuplicateNodeName  = errors.New("orm/v2: duplicate node name")
-)
-
-type FailoverMode string
-
-const (
-	FailoverManual    FailoverMode = "manual"
-	FailoverAutomatic FailoverMode = "automatic"
 )
 
 type ClusterOption func(*clusterOptions)
 
 type clusterOptions struct {
-	failoverMode          FailoverMode
 	readFallbackToPrimary bool
 	autoRecoverReplicas   bool
 }
@@ -64,22 +55,31 @@ type Node struct {
 }
 
 type ClusterHealthReport struct {
-	Status     HealthStatus
-	CheckedAt  time.Time
-	Nodes      []HealthReport
-	FailedOver bool
-	PromotedTo string
+	Status    HealthStatus
+	CheckedAt time.Time
+	Nodes     []HealthReport
 }
+
+const metricSampleCountPerNode = 10
 
 func (r ClusterHealthReport) Healthy() bool {
 	return r.Status == HealthStatusUp
 }
 
-func OpenCluster(ctx context.Context, primary Config, replicas ...Config) (*Cluster, error) {
+func OpenCluster(
+	ctx context.Context,
+	primary Config,
+	replicas ...Config,
+) (*Cluster, error) {
 	return OpenClusterWithOptions(ctx, primary, replicas)
 }
 
-func OpenClusterWithOptions(ctx context.Context, primary Config, replicas []Config, opts ...ClusterOption) (_ *Cluster, err error) {
+func OpenClusterWithOptions(
+	ctx context.Context,
+	primary Config,
+	replicas []Config,
+	opts ...ClusterOption,
+) (_ *Cluster, err error) {
 	primaryClient, err := primary.Open(ctx)
 	if err != nil {
 		return nil, err
@@ -149,15 +149,6 @@ func NewClusterWithOptions(primary *Client, replicas []*Client, opts ...ClusterO
 	}
 
 	return cluster, nil
-}
-
-func WithFailoverMode(mode FailoverMode) ClusterOption {
-	return func(options *clusterOptions) {
-		if mode == "" {
-			mode = FailoverManual
-		}
-		options.failoverMode = mode
-	}
 }
 
 func WithReadFallbackToPrimary(enabled bool) ClusterOption {
@@ -274,10 +265,10 @@ func (c *Cluster) HealthCheck(ctx context.Context) ClusterHealthReport {
 	checkedAt := time.Now()
 	nodes := c.Nodes()
 	reports := probeNodes(ctx, nodes)
-	return buildClusterReport(checkedAt, reports, false, "")
+	return buildClusterReport(checkedAt, reports)
 }
 
-func (c *Cluster) Refresh(ctx context.Context) (ClusterHealthReport, error) {
+func (c *Cluster) Refresh(ctx context.Context) ClusterHealthReport {
 	checkedAt := time.Now()
 	nodes := c.Nodes()
 	probed := probeNodesByName(ctx, nodes)
@@ -299,25 +290,10 @@ func (c *Cluster) Refresh(ctx context.Context) (ClusterHealthReport, error) {
 		}
 	}
 
-	failedOver := false
-	promotedTo := ""
-	if c.primary != nil && c.primary.state == NodeStateDown && c.options.failoverMode == FailoverAutomatic {
-		candidate := c.firstReadyReplicaLocked()
-		if candidate != nil {
-			promotedTo = candidate.name
-			c.promoteLocked(candidate, errors.New("primary failover"))
-			failedOver = true
-		}
-	}
-
 	finalReports := c.currentReportsLocked(probed)
 	c.mu.Unlock()
 
-	report := buildClusterReport(checkedAt, finalReports, failedOver, promotedTo)
-	if report.Status == HealthStatusDown && failedOver == false && c.options.failoverMode == FailoverAutomatic {
-		return report, errNoFailoverTarget
-	}
-	return report, nil
+	return buildClusterReport(checkedAt, finalReports)
 }
 
 func (c *Cluster) DrainReplica(name string, cause error) error {
@@ -353,42 +329,63 @@ func (c *Cluster) RecoverReplica(ctx context.Context, name string) error {
 	return nil
 }
 
-func (c *Cluster) MarkPrimaryDown(ctx context.Context, cause error) error {
+func (c *Cluster) MarkPrimaryDown(cause error) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.primary == nil {
-		c.mu.Unlock()
 		return errPrimaryUnavailable
 	}
 	c.primary.setState(NodeStateDown, cause)
-	auto := c.options.failoverMode == FailoverAutomatic
-	c.mu.Unlock()
-
-	if !auto {
-		return nil
-	}
-
-	_, err := c.Failover(ctx)
-	return err
+	return nil
 }
 
-func (c *Cluster) Failover(ctx context.Context) (Node, error) {
+func (c *Cluster) SwitchPrimary(ctx context.Context, name string) (Node, error) {
 	c.mu.RLock()
-	candidate := c.firstReadyReplicaLocked()
-	c.mu.RUnlock()
-	if candidate == nil {
-		return Node{}, errNoFailoverTarget
+	if c.primary != nil && c.primary.name == name {
+		current := c.primary.snapshot()
+		c.mu.RUnlock()
+		if err := current.client.PingContext(ctx); err != nil {
+			c.mu.Lock()
+			if c.primary != nil && c.primary.name == name {
+				c.primary.setState(NodeStateDown, err)
+			}
+			c.mu.Unlock()
+			return Node{}, err
+		}
+		return current, nil
 	}
 
-	return c.promoteReplica(ctx, candidate.name, errors.New("primary failover"))
-}
+	replica := c.findReplicaLocked(name)
+	c.mu.RUnlock()
+	if replica == nil {
+		return Node{}, errReplicaNotFound
+	}
 
-func (c *Cluster) PromoteReplica(ctx context.Context, name string) (Node, error) {
-	return c.promoteReplica(ctx, name, errors.New("manual failover"))
+	if err := replica.client.PingContext(ctx); err != nil {
+		c.mu.Lock()
+		replica.setState(NodeStateDown, err)
+		c.mu.Unlock()
+		return Node{}, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	replica = c.findReplicaLocked(name)
+	if replica == nil {
+		if c.primary != nil && c.primary.name == name {
+			return c.primary.snapshot(), nil
+		}
+		return Node{}, errReplicaNotFound
+	}
+
+	return c.switchPrimaryLocked(replica, errors.New("primary routing switched")), nil
 }
 
 func (c *Cluster) Metrics() []MetricSample {
 	nodes := c.Nodes()
-	metrics := make([]MetricSample, 0, len(nodes)*10)
+	metrics := make([]MetricSample, 0, len(nodes)*metricSampleCountPerNode)
 	for _, node := range nodes {
 		metrics = append(metrics, node.Metrics()...)
 	}
@@ -456,7 +453,6 @@ func (n Node) Metrics() []MetricSample {
 
 func defaultClusterOptions() clusterOptions {
 	return clusterOptions{
-		failoverMode:          FailoverManual,
 		readFallbackToPrimary: true,
 		autoRecoverReplicas:   true,
 	}
@@ -505,6 +501,7 @@ func (c *Cluster) currentReportsLocked(probed map[string]HealthReport) []HealthR
 		nodes = append(nodes, c.primary.snapshot())
 	}
 	nodes = append(nodes, snapshots(c.replicas)...)
+
 	reports := make([]HealthReport, 0, len(nodes))
 	for _, node := range nodes {
 		report, ok := probed[node.name]
@@ -513,7 +510,7 @@ func (c *Cluster) currentReportsLocked(probed map[string]HealthReport) []HealthR
 				Name:      node.name,
 				Role:      node.role,
 				State:     node.state,
-				Status:    HealthStatusUp,
+				Status:    stateToHealthStatus(node.state), // 按 state 推断初始 Status,
 				CheckedAt: time.Now(),
 				Error:     node.lastError,
 			}
@@ -533,15 +530,6 @@ func (c *Cluster) readyReplicasLocked() []*managedNode {
 	return ready
 }
 
-func (c *Cluster) firstReadyReplicaLocked() *managedNode {
-	for _, replica := range c.replicas {
-		if replica.state == NodeStateReady {
-			return replica
-		}
-	}
-	return nil
-}
-
 func (c *Cluster) findReplicaLocked(name string) *managedNode {
 	for _, replica := range c.replicas {
 		if replica.name == name {
@@ -551,33 +539,7 @@ func (c *Cluster) findReplicaLocked(name string) *managedNode {
 	return nil
 }
 
-func (c *Cluster) promoteReplica(ctx context.Context, name string, cause error) (Node, error) {
-	c.mu.RLock()
-	replica := c.findReplicaLocked(name)
-	c.mu.RUnlock()
-	if replica == nil {
-		return Node{}, errReplicaNotFound
-	}
-
-	if err := replica.client.PingContext(ctx); err != nil {
-		c.mu.Lock()
-		replica.setState(NodeStateDown, err)
-		c.mu.Unlock()
-		return Node{}, err
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	replica = c.findReplicaLocked(name)
-	if replica == nil {
-		return Node{}, errReplicaNotFound
-	}
-
-	return c.promoteLocked(replica, cause), nil
-}
-
-func (c *Cluster) promoteLocked(candidate *managedNode, cause error) Node {
+func (c *Cluster) switchPrimaryLocked(candidate *managedNode, cause error) Node {
 	oldPrimary := c.primary
 	if oldPrimary != nil {
 		oldPrimary.role = RoleReplica
@@ -616,6 +578,7 @@ func (n Node) decorateHealthReport(report HealthReport) HealthReport {
 	report.State = n.state
 
 	switch n.state {
+	case NodeStateReady:
 	case NodeStateDraining:
 		if report.Status == HealthStatusUp {
 			report.Status = HealthStatusDegraded
@@ -636,12 +599,10 @@ func (n Node) decorateHealthReport(report HealthReport) HealthReport {
 func probeNodes(ctx context.Context, nodes []Node) []HealthReport {
 	probed := make([]HealthReport, len(nodes))
 	var wg sync.WaitGroup
-	wg.Add(len(nodes))
 	for i := range nodes {
-		go func(index int) {
-			defer wg.Done()
-			probed[index] = nodes[index].HealthCheck(ctx)
-		}(i)
+		wg.Go(func() {
+			probed[i] = nodes[i].HealthCheck(ctx)
+		})
 	}
 	wg.Wait()
 	return probed
@@ -656,13 +617,11 @@ func probeNodesByName(ctx context.Context, nodes []Node) map[string]HealthReport
 	return indexed
 }
 
-func buildClusterReport(checkedAt time.Time, reports []HealthReport, failedOver bool, promotedTo string) ClusterHealthReport {
+func buildClusterReport(checkedAt time.Time, reports []HealthReport) ClusterHealthReport {
 	report := ClusterHealthReport{
-		Status:     HealthStatusUp,
-		CheckedAt:  checkedAt,
-		Nodes:      reports,
-		FailedOver: failedOver,
-		PromotedTo: promotedTo,
+		Status:    HealthStatusUp,
+		CheckedAt: checkedAt,
+		Nodes:     reports,
 	}
 
 	for _, node := range reports {
@@ -679,13 +638,24 @@ func buildClusterReport(checkedAt time.Time, reports []HealthReport, failedOver 
 }
 
 func snapshots(nodes []*managedNode) []Node {
-	snapshots := make([]Node, len(nodes))
+	snapshotNodes := make([]Node, len(nodes))
 	for i, node := range nodes {
-		snapshots[i] = node.snapshot()
+		snapshotNodes[i] = node.snapshot()
 	}
-	return snapshots
+	return snapshotNodes
 }
 
 func replicaName(index int) string {
 	return "replica-" + strconv.Itoa(index+1)
+}
+
+func stateToHealthStatus(state NodeState) HealthStatus {
+	switch state {
+	case NodeStateReady:
+		return HealthStatusUp
+	case NodeStateDraining:
+		return HealthStatusDegraded
+	default:
+		return HealthStatusDown
+	}
 }

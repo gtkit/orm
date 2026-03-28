@@ -29,7 +29,6 @@ func defaultMysqlOptions() options {
 	}
 }
 
-// NewMysql 实例化数据库连接, 出错时直接 panic.
 func NewMysql(setter ...Setter) *gorm.DB {
 	db, err := OpenMysql(setter...)
 	if err != nil {
@@ -38,12 +37,10 @@ func NewMysql(setter ...Setter) *gorm.DB {
 	return db
 }
 
-// OpenMysql 实例化数据库连接, 并返回 error 供调用方处理.
 func OpenMysql(setter ...Setter) (*gorm.DB, error) {
 	mydb := new(Mysql)
 	mysqlOpts := mysqlOptionsSnapshot()
 	db, err := mydb.open(buildMySQLDSN(mysqlOpts), gormConfigSnapshot())
-
 	if err != nil {
 		return nil, err
 	}
@@ -52,43 +49,46 @@ func OpenMysql(setter ...Setter) (*gorm.DB, error) {
 		return nil, db.Error
 	}
 
-	if err := applyPoolOptions(db, mysqlOpts); err != nil {
-		return nil, err
+	if applyErr := applyPoolOptions(db, mysqlOpts); applyErr != nil {
+		return nil, applyErr
 	}
 
-	// 自定义配置
-	if len(setter) > 0 && setter[0] != nil {
-		setter[0].Set(db)
-	}
-
+	applySetters(db, setter)
 	return db, nil
 }
 
 type Setter interface {
+	// Set is applied after connection pool options.
+	// Implementations should avoid mutating the underlying *sql.DB pool settings;
+	// use MysqlConfig(MaxOpenConns(...)) and related options instead.
 	Set(db *gorm.DB)
 }
 
 type Mysql struct{}
 
-// MysqlConfig 配置 MySQL 连接参数.
 func MysqlConfig(opts ...Options) {
 	configMu.Lock()
 	defer configMu.Unlock()
 
 	mop = defaultMysqlOptions()
-	for _, o := range opts {
-		o.apply(&mop)
+	for _, option := range opts {
+		if option == nil {
+			continue
+		}
+		option.apply(&mop)
 	}
 }
 
-// GormConfig 配置 GORM 行为参数.
 func GormConfig(opts ...GormOptions) {
 	configMu.Lock()
 	defer configMu.Unlock()
 
 	gop = defaultGormConfig()
-	for _, o := range opts {
-		o.apply(&gop)
+	for _, option := range opts {
+		if option == nil {
+			continue
+		}
+		option.apply(&gop)
 	}
 }
 
@@ -96,11 +96,11 @@ func (e *Mysql) GetConnect() string {
 	return buildMySQLDSN(mysqlOptionsSnapshot())
 }
 
-func (e *Mysql) Open(conn string) (db *gorm.DB, err error) {
+func (e *Mysql) Open(conn string) (*gorm.DB, error) {
 	return e.open(conn, gormConfigSnapshot())
 }
 
-func (e *Mysql) open(conn string, conf gorm.Config) (db *gorm.DB, err error) {
+func (e *Mysql) open(conn string, conf gorm.Config) (*gorm.DB, error) {
 	return gorm.Open(gormmysql.Open(conn), &conf)
 }
 
@@ -176,4 +176,13 @@ func applyPoolOptions(db *gorm.DB, opt options) error {
 	}
 
 	return nil
+}
+
+func applySetters(db *gorm.DB, setters []Setter) {
+	for _, setter := range setters {
+		if setter == nil {
+			continue
+		}
+		setter.Set(db)
+	}
 }

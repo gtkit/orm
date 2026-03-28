@@ -3,135 +3,119 @@ package zlogger
 import (
 	"context"
 	"errors"
-	"fmt"
-	"path/filepath"
-	"runtime"
-	"strings"
 	"time"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
-
-	"github.com/gtkit/logger"
+	"gorm.io/gorm/utils"
 )
 
 const slowTime = 200 * time.Millisecond
 
-// GormLogger 操作对象，实现 gormlogger.Interface.
+// GormLogger preserves the v1 exported field surface for compatibility.
+// Treat instances as immutable after construction; configure through options
+// before sharing them across goroutines.
 type GormLogger struct {
-	ZapLogger     *zap.Logger
-	SlowThreshold time.Duration
-	sqlLog        bool
-	ignoreTrace   bool
+	// ZapLogger is exported for v1 compatibility. Do not mutate it after construction.
+	ZapLogger *zap.Logger
+	// SlowThreshold is exported for v1 compatibility. Do not mutate it after construction.
+	SlowThreshold             time.Duration
+	sqlLog                    bool
+	ignoreTrace               bool
+	logLevel                  gormlogger.LogLevel
+	ignoreRecordNotFoundError bool
+	parameterizedQueries      bool
 }
 
-// 确保 GormLogger 实现了 gormlogger.Interface.
 func _() {
 	var _ gormlogger.Interface = (*GormLogger)(nil)
 }
 
-// New 创建一个 GormLogger 对象.
-// @Param zaplogger zap实例.
-// @Param sqlLog 是否打印 sql 日志,默认不打印.
 func New(options ...Option) gormlogger.Interface {
-	l := GormLogger{
+	logger := GormLogger{
+		ZapLogger:     zap.NewNop(),
 		SlowThreshold: slowTime,
+		logLevel:      gormlogger.Warn,
 	}
-	// Apply options
 	for _, option := range options {
-		option(&l)
+		if option != nil {
+			option(&logger)
+		}
 	}
-	if l.ZapLogger == nil {
-		logger.NewZap(logger.WithFile(true), logger.WithConsole(true))
-		logger.ZInfo("**** gorm new zap logger ****")
-		l.ZapLogger = logger.Zlog()
+	return logger
+}
+
+func (l GormLogger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
+	clone := l
+	clone.logLevel = level
+	return clone
+}
+
+func (l GormLogger) Info(_ context.Context, msg string, data ...any) {
+	if l.logLevel < gormlogger.Info {
+		return
 	}
-
-	return l
+	l.sugar().Infof(msg, data...)
 }
 
-// LogMode 实现 gormlogger.Interface 的 LogMode 方法.
-func (l GormLogger) LogMode(_ gormlogger.LogLevel) gormlogger.Interface {
-	return l
+func (l GormLogger) Warn(_ context.Context, msg string, data ...any) {
+	if l.logLevel < gormlogger.Warn {
+		return
+	}
+	l.sugar().Warnf(msg, data...)
 }
 
-func (l GormLogger) Info(_ context.Context, s string, i ...any) {
-	l.sugar().Debugf(s, i...)
-}
-
-func (l GormLogger) Warn(_ context.Context, s string, i ...any) {
-	l.sugar().Warnf(s, i...)
-}
-
-func (l GormLogger) Error(_ context.Context, s string, i ...any) {
-	l.sugar().Errorf(s, i...)
+func (l GormLogger) Error(_ context.Context, msg string, data ...any) {
+	if l.logLevel < gormlogger.Error {
+		return
+	}
+	l.sugar().Errorf(msg, data...)
 }
 
 func (l GormLogger) Trace(_ context.Context, begin time.Time, fc func() (sql string, rowsAffected int64), err error) {
-	// 忽略 trace 日志
-	if l.ignoreTrace {
+	if l.logLevel <= gormlogger.Silent || l.ignoreTrace {
 		return
 	}
-	// 获取运行时间
+
 	elapsed := time.Since(begin)
-	// 获取 SQL 请求和返回条数
 	sql, rows := fc()
 
-	// 通用字段
-	logFields := []zap.Field{
+	fields := []zap.Field{
+		zap.String("source", utils.FileWithLineNum()),
+		zap.Duration("elapsed", elapsed),
 		zap.String("sql", sql),
-		zap.String("time", fmt.Sprintf("%.3fms", float64(elapsed)/float64(time.Millisecond))),
-		zap.Int64("rows", rows),
 	}
-	// Gorm 错误
-	if err != nil {
-		// 记录未找到的错误使用 warning 等级
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			l.logger().Warn("Database ErrRecordNotFound", logFields...)
-		} else {
-			// 其他错误使用 error 等级
-			logFields = append(logFields, zap.Error(err))
-			l.logger().Error("Database Error", logFields...)
-		}
+	if rows >= 0 {
+		fields = append(fields, zap.Int64("rows", rows))
 	}
 
-	// 慢查询日志
-	if l.SlowThreshold != 0 && elapsed > l.SlowThreshold {
-		l.logger().Warn("Database Slow Log", logFields...)
-	}
+	recordNotFoundIgnored := errors.Is(err, gorm.ErrRecordNotFound) && l.ignoreRecordNotFoundError
 
-	// 记录所有 SQL 请求
-	if l.sqlLog {
-		l.logger().Debug("Database Query", logFields...)
+	switch {
+	case err != nil && l.logLevel >= gormlogger.Error && !recordNotFoundIgnored:
+		l.base().Error("gorm query error", append(fields, zap.Error(err))...)
+	case l.SlowThreshold != 0 && elapsed > l.SlowThreshold && l.logLevel >= gormlogger.Warn:
+		l.base().Warn("gorm slow query", append(fields, zap.Duration("slow_threshold", l.SlowThreshold))...)
+	case l.sqlLog || l.logLevel == gormlogger.Info:
+		l.base().Info("gorm query", fields...)
 	}
 }
 
-func (l GormLogger) logger() *zap.Logger {
-	// 跳过 gorm 内置的调用
-	var (
-		gormPackage    = filepath.Join("gorm.io", "gorm")
-		zapgormPackage = filepath.Join("moul.io", "zapgorm2")
-	)
+func (l GormLogger) ParamsFilter(_ context.Context, sql string, params ...interface{}) (string, []interface{}) {
+	if l.parameterizedQueries {
+		return sql, nil
+	}
+	return sql, params
+}
 
-	// 减去一次封装，以及一次在 logger 初始化里添加 zap.AddCallerSkip(1)
-	clone := l.ZapLogger.WithOptions(zap.AddCallerSkip(-2))
-
-	for i := 2; i < 15; i++ {
-		_, file, _, ok := runtime.Caller(i)
-		switch {
-		case !ok:
-		case strings.HasSuffix(file, "_test.go"):
-		case strings.Contains(file, gormPackage):
-		case strings.Contains(file, zapgormPackage):
-		default:
-			// 返回一个附带跳过行号的新的 zap logger
-			return clone.WithOptions(zap.AddCallerSkip(i))
-		}
+func (l GormLogger) base() *zap.Logger {
+	if l.ZapLogger == nil {
+		return zap.NewNop()
 	}
 	return l.ZapLogger
 }
 
 func (l GormLogger) sugar() *zap.SugaredLogger {
-	return l.logger().Sugar()
+	return l.base().Sugar()
 }
