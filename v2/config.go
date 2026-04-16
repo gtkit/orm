@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"maps"
 	"net"
 	"time"
@@ -15,8 +16,17 @@ import (
 	"gorm.io/gorm/schema"
 )
 
-const defaultDialTimeout = 10 * time.Second
-const defaultIdentifierMaxLength = 64
+const (
+	defaultDialTimeout         = 10 * time.Second
+	defaultReadTimeout         = 30 * time.Second
+	defaultWriteTimeout        = 30 * time.Second
+	defaultIdentifierMaxLength = 64
+	defaultMaxOpenConns        = 50
+	defaultMaxIdleConns        = 10
+	defaultConnMaxLifetime     = 30 * time.Minute
+	defaultConnMaxIdleTime     = 10 * time.Minute
+	defaultHealthCheckTimeout  = 5 * time.Second
+)
 
 var (
 	errNilSQLDB       = errors.New("orm/v2: nil *sql.DB")
@@ -36,22 +46,22 @@ type Config struct {
 // Addr takes precedence over Host and Port when both are set.
 // Prefer the Option helpers so Addr/Host/Port precedence stays consistent.
 type MySQLConfig struct {
-	User                 string
-	Password             string
-	Net                  string
-	Host                 string
-	Port                 string
-	Addr                 string
-	Database             string
-	Params               map[string]string
-	ConnectionAttributes string
-	Collation            string
-	Loc                  *time.Location
-	TLSConfig            string
-	Timeout              time.Duration
-	ReadTimeout          time.Duration
-	WriteTimeout         time.Duration
-	ParseTime            bool
+	User                 string            `json:"user"     yaml:"user"`
+	Password             string            `json:"-"        yaml:"-"`
+	Net                  string            `json:"net"      yaml:"net"`
+	Host                 string            `json:"host"     yaml:"host"`
+	Port                 string            `json:"port"     yaml:"port"`
+	Addr                 string            `json:"addr"     yaml:"addr"`
+	Database             string            `json:"database" yaml:"database"`
+	Params               map[string]string `json:"params"   yaml:"params"`
+	ConnectionAttributes string            `json:"connection_attributes" yaml:"connection_attributes"`
+	Collation            string            `json:"collation" yaml:"collation"`
+	Loc                  *time.Location    `json:"-"        yaml:"-"`
+	TLSConfig            string            `json:"tls_config" yaml:"tls_config"`
+	Timeout              time.Duration     `json:"timeout"  yaml:"timeout"`
+	ReadTimeout          time.Duration     `json:"read_timeout" yaml:"read_timeout"`
+	WriteTimeout         time.Duration     `json:"write_timeout" yaml:"write_timeout"`
+	ParseTime            bool              `json:"parse_time" yaml:"parse_time"`
 }
 
 type PoolConfig struct {
@@ -103,18 +113,43 @@ type MySQLDialectConfig struct {
 	DontSupportDropConstraint     bool
 }
 
+// String returns a human-readable representation with the password redacted.
+// This prevents accidental credential leakage via fmt.Print / log output.
+func (c Config) String() string {
+	dsn, err := c.RedactedDSN()
+	if err != nil {
+		return fmt.Sprintf("orm.Config{name=%s, err=%v}", c.Name, err)
+	}
+	return fmt.Sprintf("orm.Config{name=%s, dsn=%s}", c.Name, dsn)
+}
+
+// GoString implements fmt.GoStringer so %#v also redacts the password.
+func (c Config) GoString() string { return c.String() }
+
 func DefaultConfig() Config {
 	return Config{
 		MySQL: MySQLConfig{
-			Net:       "tcp",
-			Host:      "127.0.0.1",
-			Port:      "3306",
-			Loc:       time.Local,
-			Timeout:   defaultDialTimeout,
-			ParseTime: true,
+			Net:          "tcp",
+			Host:         "127.0.0.1",
+			Port:         "3306",
+			Loc:          time.Local,
+			Timeout:      defaultDialTimeout,
+			ReadTimeout:  defaultReadTimeout,
+			WriteTimeout: defaultWriteTimeout,
+			ParseTime:    true,
 			Params: map[string]string{
 				"charset": "utf8mb4",
 			},
+		},
+		Pool: PoolConfig{
+			MaxOpenConns:       defaultMaxOpenConns,
+			MaxIdleConns:       defaultMaxIdleConns,
+			ConnMaxLifetime:    defaultConnMaxLifetime,
+			ConnMaxIdleTime:    defaultConnMaxIdleTime,
+			hasMaxOpenConns:    true,
+			hasMaxIdleConns:    true,
+			hasConnMaxLifetime: true,
+			hasConnMaxIdleTime: true,
 		},
 		GORM: GORMConfig{
 			NamingStrategy: defaultNamingStrategy(),

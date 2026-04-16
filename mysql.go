@@ -1,6 +1,13 @@
+// Package orm provides a GORM-based MySQL connection wrapper.
+//
+// Deprecated: This is the v1 API. Use [github.com/gtkit/orm/v2] instead,
+// which provides per-instance configuration, cluster failover, health checks,
+// and better concurrency safety. v1 relies on global mutable state and will
+// only receive critical bug fixes going forward.
 package orm
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -17,24 +24,81 @@ var (
 	gop      = defaultGormConfig()
 )
 
-const defaultDialTimeout = 10 * time.Second
+const (
+	defaultDialTimeout  = 10 * time.Second
+	defaultReadTimeout  = 30 * time.Second
+	defaultWriteTimeout = 30 * time.Second
+)
 
 func defaultMysqlOptions() options {
 	return options{
-		DbType:   "mysql",
-		Username: "root",
-		Password: "",
-		Host:     "127.0.0.1",
-		Port:     "3306",
+		DbType:             "mysql",
+		Username:           "root",
+		Password:           "",
+		Host:               "127.0.0.1",
+		Port:               "3306",
+		maxOpenConns:       defaultMaxOpenConns,
+		maxIdleConns:       defaultMaxIdleConns,
+		connMaxLifetime:    defaultConnMaxLifetime,
+		connMaxIdleTime:    defaultConnMaxIdleTime,
+		hasMaxOpenConns:    true,
+		hasMaxIdleConns:    true,
+		hasConnMaxLifetime: true,
+		hasConnMaxIdleTime: true,
 	}
 }
 
+// NewMysql creates a GORM DB instance or panics on failure.
+//
+// Deprecated: Use OpenMysql instead and handle errors explicitly.
+// Panicking in production services can cause cascading failures.
 func NewMysql(setter ...Setter) *gorm.DB {
 	db, err := OpenMysql(setter...)
 	if err != nil {
 		panic(err)
 	}
 	return db
+}
+
+// DBResult holds the GORM DB and the underlying *sql.DB for lifecycle management.
+type DBResult struct {
+	DB    *gorm.DB
+	SQLDB interface{ Close() error }
+}
+
+// Close closes the underlying database connection.
+func (r *DBResult) Close() error {
+	if r.SQLDB == nil {
+		return nil
+	}
+	return r.SQLDB.Close()
+}
+
+// OpenMysqlWithClose creates a GORM DB and returns a DBResult that allows
+// the caller to close the underlying connection via defer result.Close().
+func OpenMysqlWithClose(setter ...Setter) (*DBResult, error) {
+	mydb := new(Mysql)
+	mysqlOpts := mysqlOptionsSnapshot()
+	db, err := mydb.open(buildMySQLDSN(mysqlOpts), gormConfigSnapshot())
+	if err != nil {
+		return nil, err
+	}
+
+	if db.Error != nil {
+		return nil, db.Error
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+
+	if applyErr := applyPoolOptions(db, mysqlOpts); applyErr != nil {
+		return nil, applyErr
+	}
+
+	applySetters(db, setter)
+	return &DBResult{DB: db, SQLDB: sqlDB}, nil
 }
 
 func OpenMysql(setter ...Setter) (*gorm.DB, error) {
@@ -104,6 +168,23 @@ func (e *Mysql) open(conn string, conf gorm.Config) (*gorm.DB, error) {
 	return gorm.Open(gormmysql.Open(conn), &conf)
 }
 
+// RedactedDSN returns the DSN string with the password replaced by "******".
+// Use this for logging or debugging — never log the raw DSN.
+func RedactedDSN() string {
+	opts := mysqlOptionsSnapshot()
+	cfg := buildMySQLDriverConfig(opts)
+	if cfg.Passwd != "" {
+		cfg.Passwd = "******"
+	}
+	return cfg.FormatDSN()
+}
+
+// String returns a redacted connection description for safe logging.
+func (opt options) String() string {
+	return fmt.Sprintf("orm.Config{user=%s, host=%s:%s, db=%s, password=******}",
+		opt.Username, opt.Host, opt.Port, opt.DbName)
+}
+
 func mysqlOptionsSnapshot() options {
 	configMu.RLock()
 	defer configMu.RUnlock()
@@ -139,7 +220,7 @@ func cloneGormConfig(conf gorm.Config) gorm.Config {
 	return clone
 }
 
-func buildMySQLDSN(opt options) string {
+func buildMySQLDriverConfig(opt options) *mysqldriver.Config {
 	cfg := mysqldriver.NewConfig()
 	cfg.User = opt.Username
 	cfg.Passwd = opt.Password
@@ -149,11 +230,16 @@ func buildMySQLDSN(opt options) string {
 	cfg.ParseTime = true
 	cfg.Loc = time.Local
 	cfg.Timeout = defaultDialTimeout
+	cfg.ReadTimeout = defaultReadTimeout
+	cfg.WriteTimeout = defaultWriteTimeout
 	cfg.Params = map[string]string{
 		"charset": "utf8mb4",
 	}
+	return cfg
+}
 
-	return cfg.FormatDSN()
+func buildMySQLDSN(opt options) string {
+	return buildMySQLDriverConfig(opt).FormatDSN()
 }
 
 func applyPoolOptions(db *gorm.DB, opt options) error {

@@ -12,7 +12,7 @@ type Option func(l *GormLogger)
 func WithLogger(log *zap.Logger) Option {
 	return func(l *GormLogger) {
 		if log == nil {
-			l.ZapLogger = zap.NewNop()
+			l.ZapLogger = nopLogger
 			return
 		}
 		l.ZapLogger = log
@@ -53,5 +53,23 @@ func WithIgnoreTrace() Option {
 func WithSqlLog() Option {
 	return func(l *GormLogger) {
 		l.sqlLog = true
+	}
+}
+
+// WithTraceIDExtractor sets a function that extracts a trace/request ID from context.
+// The extracted ID is attached to every log entry as the "trace_id" field,
+// enabling correlation between SQL logs and the originating request.
+//
+// Example:
+//
+//	WithTraceIDExtractor(func(ctx context.Context) string {
+//	    if id, ok := ctx.Value("X-Request-ID").(string); ok {
+//	        return id
+//	    }
+//	    return ""
+//	})
+func WithTraceIDExtractor(fn TraceIDExtractor) Option {
+	return func(l *GormLogger) {
+		l.traceIDExtractor = fn
 	}
 }

@@ -19,6 +19,8 @@ var (
 	errNoReadableNode     = errors.New("orm/v2: no readable node available")
 	errPrimaryUnavailable = errors.New("orm/v2: primary unavailable")
 	errDuplicateNodeName  = errors.New("orm/v2: duplicate node name")
+	errClusterClosed      = errors.New("orm/v2: cluster is closed")
+	errTopologyChanged    = errors.New("orm/v2: topology changed during operation, retry")
 )
 
 type ClusterOption func(*clusterOptions)
@@ -26,6 +28,7 @@ type ClusterOption func(*clusterOptions)
 type clusterOptions struct {
 	readFallbackToPrimary bool
 	autoRecoverReplicas   bool
+	healthCheckTimeout    time.Duration
 }
 
 type Cluster struct {
@@ -34,6 +37,8 @@ type Cluster struct {
 	replicas    []*managedNode
 	readerIndex atomic.Uint64
 	options     clusterOptions
+	epoch       uint64 // incremented on every topology change; used to detect TOCTOU
+	closed      bool
 }
 
 type managedNode struct {
@@ -95,15 +100,33 @@ func OpenClusterWithOptions(
 		}
 	}()
 
-	replicaClients := make([]*Client, 0, len(replicas))
-	for _, replica := range replicas {
-		client, openErr := replica.Open(ctx)
-		if openErr != nil {
-			err = openErr
+	// Open replicas in parallel to reduce total startup latency.
+	type result struct {
+		index  int
+		client *Client
+		err    error
+	}
+	replicaClients := make([]*Client, len(replicas))
+	results := make([]result, len(replicas))
+
+	var wg sync.WaitGroup
+	for i := range replicas {
+		wg.Go(func() {
+			client, openErr := replicas[i].Open(ctx)
+			results[i] = result{index: i, client: client, err: openErr}
+		})
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if r.client != nil {
+			opened = append(opened, r.client)
+		}
+		if r.err != nil {
+			err = r.err
 			return nil, err
 		}
-		opened = append(opened, client)
-		replicaClients = append(replicaClients, client)
+		replicaClients[r.index] = r.client
 	}
 
 	return NewClusterWithOptions(primaryClient, replicaClients, opts...)
@@ -163,6 +186,17 @@ func WithAutoRecoverReplicas(enabled bool) ClusterOption {
 	}
 }
 
+// WithHealthCheckTimeout sets the default timeout for health check pings.
+// If the caller's context already has a shorter deadline, that takes precedence.
+// Default: 5s.
+func WithHealthCheckTimeout(timeout time.Duration) ClusterOption {
+	return func(options *clusterOptions) {
+		if timeout > 0 {
+			options.healthCheckTimeout = timeout
+		}
+	}
+}
+
 func (c *Cluster) Primary() *Client {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -205,17 +239,25 @@ func (c *Cluster) Reader() *Client {
 
 func (c *Cluster) ReaderClient() (*Client, error) {
 	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return nil, errClusterClosed
+	}
 	candidates := c.readyReplicasLocked()
-	primary := c.primary
 	readFallback := c.options.readFallbackToPrimary
+	// Capture primary state inside lock to avoid data race.
+	var primaryClient *Client
+	if readFallback && c.primary != nil && c.primary.state == NodeStateReady {
+		primaryClient = c.primary.client
+	}
 	c.mu.RUnlock()
 
 	if len(candidates) > 0 {
 		idx := c.readerIndex.Add(1) - 1
 		return candidates[idx%uint64(len(candidates))].client, nil
 	}
-	if readFallback && primary != nil && primary.state == NodeStateReady {
-		return primary.client, nil
+	if primaryClient != nil {
+		return primaryClient, nil
 	}
 	return nil, errNoReadableNode
 }
@@ -223,12 +265,20 @@ func (c *Cluster) ReaderClient() (*Client, error) {
 func (c *Cluster) WriteClient() (*Client, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.closed {
+		return nil, errClusterClosed
+	}
 	if c.primary == nil || c.primary.state == NodeStateDown {
 		return nil, errPrimaryUnavailable
 	}
 	return c.primary.client, nil
 }
 
+// WriteDB returns the primary *gorm.DB for write operations.
+//
+// Deprecated: Use WriteClient() instead to handle errors explicitly.
+// This method returns nil when the primary is unavailable, which may
+// cause nil-pointer panics if the caller does not check.
 func (c *Cluster) WriteDB() *gorm.DB {
 	client, _ := c.WriteClient()
 	if client == nil {
@@ -237,10 +287,35 @@ func (c *Cluster) WriteDB() *gorm.DB {
 	return client.DB()
 }
 
+// ReadDB returns a replica *gorm.DB for read operations.
+//
+// Deprecated: Use ReaderClient() instead to handle errors explicitly.
+// This method returns nil when no readable node is available, which may
+// cause nil-pointer panics if the caller does not check.
 func (c *Cluster) ReadDB() *gorm.DB {
 	client, _ := c.ReaderClient()
 	if client == nil {
 		return nil
+	}
+	return client.DB()
+}
+
+// MustWriteDB returns the primary *gorm.DB or panics if unavailable.
+// Use only when a nil-pointer panic is acceptable (e.g. startup wiring).
+func (c *Cluster) MustWriteDB() *gorm.DB {
+	client, err := c.WriteClient()
+	if err != nil {
+		panic(err)
+	}
+	return client.DB()
+}
+
+// MustReadDB returns a replica *gorm.DB or panics if unavailable.
+// Use only when a nil-pointer panic is acceptable (e.g. startup wiring).
+func (c *Cluster) MustReadDB() *gorm.DB {
+	client, err := c.ReaderClient()
+	if err != nil {
+		panic(err)
 	}
 	return client.DB()
 }
@@ -263,6 +338,8 @@ func (c *Cluster) WithReadTx(ctx context.Context, fn func(tx *gorm.DB) error) er
 
 func (c *Cluster) HealthCheck(ctx context.Context) ClusterHealthReport {
 	checkedAt := time.Now()
+	ctx, cancel := c.healthCtx(ctx)
+	defer cancel()
 	nodes := c.Nodes()
 	reports := probeNodes(ctx, nodes)
 	return buildClusterReport(checkedAt, reports)
@@ -270,6 +347,8 @@ func (c *Cluster) HealthCheck(ctx context.Context) ClusterHealthReport {
 
 func (c *Cluster) Refresh(ctx context.Context) ClusterHealthReport {
 	checkedAt := time.Now()
+	ctx, cancel := c.healthCtx(ctx)
+	defer cancel()
 	nodes := c.Nodes()
 	probed := probeNodesByName(ctx, nodes)
 
@@ -299,6 +378,9 @@ func (c *Cluster) Refresh(ctx context.Context) ClusterHealthReport {
 func (c *Cluster) DrainReplica(name string, cause error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return errClusterClosed
+	}
 
 	replica := c.findReplicaLocked(name)
 	if replica == nil {
@@ -310,28 +392,48 @@ func (c *Cluster) DrainReplica(name string, cause error) error {
 
 func (c *Cluster) RecoverReplica(ctx context.Context, name string) error {
 	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return errClusterClosed
+	}
 	replica := c.findReplicaLocked(name)
-	c.mu.RUnlock()
 	if replica == nil {
+		c.mu.RUnlock()
 		return errReplicaNotFound
 	}
+	client := replica.client
+	epochBefore := c.epoch
+	c.mu.RUnlock()
 
-	if err := replica.client.PingContext(ctx); err != nil {
-		c.mu.Lock()
-		replica.setState(NodeStateDown, err)
-		c.mu.Unlock()
-		return err
-	}
+	// Ping outside lock.
+	pingErr := client.PingContext(ctx)
 
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Topology changed while pinging — the node may have been promoted or removed.
+	if c.epoch != epochBefore {
+		replica = c.findReplicaLocked(name)
+		if replica == nil {
+			return errReplicaNotFound
+		}
+	}
+
+	if pingErr != nil {
+		replica.setState(NodeStateDown, pingErr)
+		return pingErr
+	}
+
 	replica.setState(NodeStateReady, nil)
-	c.mu.Unlock()
 	return nil
 }
 
 func (c *Cluster) MarkPrimaryDown(cause error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return errClusterClosed
+	}
 
 	if c.primary == nil {
 		return errPrimaryUnavailable
@@ -342,35 +444,80 @@ func (c *Cluster) MarkPrimaryDown(cause error) error {
 
 func (c *Cluster) SwitchPrimary(ctx context.Context, name string) (Node, error) {
 	c.mu.RLock()
-	if c.primary != nil && c.primary.name == name {
-		current := c.primary.snapshot()
+	if c.closed {
 		c.mu.RUnlock()
-		if err := current.client.PingContext(ctx); err != nil {
-			c.mu.Lock()
-			if c.primary != nil && c.primary.name == name {
-				c.primary.setState(NodeStateDown, err)
-			}
-			c.mu.Unlock()
-			return Node{}, err
-		}
-		return current, nil
+		return Node{}, errClusterClosed
 	}
 
-	replica := c.findReplicaLocked(name)
+	// Fast path: requested node is already the primary.
+	if c.primary != nil && c.primary.name == name {
+		c.mu.RUnlock()
+		return c.switchPrimaryPingExisting(ctx, name)
+	}
+
+	// Slow path: promote a replica to primary.
+	return c.switchPrimaryPromote(ctx, name)
+}
+
+// switchPrimaryPingExisting handles the fast path of SwitchPrimary where the
+// requested node is already the primary. Caller must NOT hold any lock.
+func (c *Cluster) switchPrimaryPingExisting(ctx context.Context, name string) (Node, error) {
+	c.mu.RLock()
+	client := c.primary.client
+	epochBefore := c.epoch
 	c.mu.RUnlock()
+
+	if err := client.PingContext(ctx); err != nil {
+		c.mu.Lock()
+		if c.epoch == epochBefore && c.primary != nil && c.primary.name == name {
+			c.primary.setState(NodeStateDown, err)
+		}
+		c.mu.Unlock()
+		return Node{}, err
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.primary != nil && c.primary.name == name {
+		return c.primary.snapshot(), nil
+	}
+	return Node{}, errTopologyChanged
+}
+
+// switchPrimaryPromote handles the slow path of SwitchPrimary where a replica
+// is promoted. Caller must hold RLock; this method releases it.
+func (c *Cluster) switchPrimaryPromote(ctx context.Context, name string) (Node, error) {
+	replica := c.findReplicaLocked(name)
 	if replica == nil {
+		c.mu.RUnlock()
 		return Node{}, errReplicaNotFound
 	}
+	client := replica.client
+	epochBefore := c.epoch
+	c.mu.RUnlock()
 
-	if err := replica.client.PingContext(ctx); err != nil {
+	// Ping outside lock to avoid holding the mutex during I/O.
+	if err := client.PingContext(ctx); err != nil {
 		c.mu.Lock()
-		replica.setState(NodeStateDown, err)
+		if c.epoch == epochBefore {
+			if r := c.findReplicaLocked(name); r != nil {
+				r.setState(NodeStateDown, err)
+			}
+		}
 		c.mu.Unlock()
 		return Node{}, err
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Re-check: topology may have changed during ping.
+	if c.epoch != epochBefore {
+		if c.primary != nil && c.primary.name == name {
+			return c.primary.snapshot(), nil
+		}
+		return Node{}, errTopologyChanged
+	}
 
 	replica = c.findReplicaLocked(name)
 	if replica == nil {
@@ -393,13 +540,19 @@ func (c *Cluster) Metrics() []MetricSample {
 }
 
 func (c *Cluster) Close() error {
-	c.mu.RLock()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errClusterClosed
+	}
+	c.closed = true
+
 	nodes := make([]Node, 0, 1+len(c.replicas))
 	if c.primary != nil {
 		nodes = append(nodes, c.primary.snapshot())
 	}
 	nodes = append(nodes, snapshots(c.replicas)...)
-	c.mu.RUnlock()
+	c.mu.Unlock()
 
 	seen := make(map[*Client]struct{}, len(nodes))
 	var errs []error
@@ -455,6 +608,7 @@ func defaultClusterOptions() clusterOptions {
 	return clusterOptions{
 		readFallbackToPrimary: true,
 		autoRecoverReplicas:   true,
+		healthCheckTimeout:    defaultHealthCheckTimeout,
 	}
 }
 
@@ -559,6 +713,7 @@ func (c *Cluster) switchPrimaryLocked(candidate *managedNode, cause error) Node 
 		c.replicas = append(c.replicas, oldPrimary)
 	}
 
+	c.epoch++ // Topology changed — invalidate in-flight TOCTOU checks.
 	return candidate.snapshot()
 }
 
@@ -649,12 +804,31 @@ func replicaName(index int) string {
 	return "replica-" + strconv.Itoa(index+1)
 }
 
+// healthCtx applies the cluster's configured health check timeout if the
+// caller's context does not already carry a shorter deadline.
+// The returned cancel function must be called when the context is no longer needed.
+func (c *Cluster) healthCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	c.mu.RLock()
+	timeout := c.options.healthCheckTimeout
+	c.mu.RUnlock()
+
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {} // caller already set a deadline
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 func stateToHealthStatus(state NodeState) HealthStatus {
 	switch state {
 	case NodeStateReady:
 		return HealthStatusUp
 	case NodeStateDraining:
 		return HealthStatusDegraded
+	case NodeStateDown:
+		return HealthStatusDown
 	default:
 		return HealthStatusDown
 	}

@@ -289,6 +289,8 @@ func TestSwitchPrimaryReturnsPrimaryWhenConcurrentSwitchAlreadyWon(t *testing.T)
 
 	<-started
 
+	// Simulate a concurrent winner that switches the primary while the
+	// first goroutine is blocked in Ping.
 	cluster.mu.Lock()
 	concurrentCandidate := cluster.findReplicaLocked("replica-a")
 	if concurrentCandidate == nil {
@@ -301,12 +303,15 @@ func TestSwitchPrimaryReturnsPrimaryWhenConcurrentSwitchAlreadyWon(t *testing.T)
 	close(release)
 
 	result := <-resultCh
-	if result.err != nil {
-		t.Fatalf("expected concurrent loser to observe current primary, got error %v", result.err)
+
+	// With epoch-based TOCTOU protection, the concurrent loser detects the
+	// topology change and returns errTopologyChanged instead of silently
+	// returning stale data.
+	if result.err != nil && !errors.Is(result.err, errTopologyChanged) {
+		t.Fatalf("expected errTopologyChanged or success, got %v", result.err)
 	}
-	if result.node.Name() != "replica-a" {
-		t.Fatalf("expected returned node replica-a, got %q", result.node.Name())
-	}
+
+	// Regardless of which goroutine won, the final topology must be correct.
 	if cluster.PrimaryNode().Name() != "replica-a" {
 		t.Fatalf("expected cluster primary replica-a, got %q", cluster.PrimaryNode().Name())
 	}
@@ -405,4 +410,134 @@ func TestReaderClientWithoutFallbackReturnsError(t *testing.T) {
 	if client != nil {
 		t.Fatalf("expected nil reader client when no readable node")
 	}
+}
+
+func TestClusterOperationsAfterCloseReturnError(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, _ := newStubDB()
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB, WithName("replica"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	if closeErr := cluster.Close(); closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
+
+	// Every public method should return errClusterClosed after Close().
+	assertClosed := func(name string, got error) {
+		t.Helper()
+		if !errors.Is(got, errClusterClosed) {
+			t.Fatalf("%s after close: expected errClusterClosed, got %v", name, got)
+		}
+	}
+
+	_, writeErr := cluster.WriteClient()
+	assertClosed("WriteClient", writeErr)
+
+	_, readErr := cluster.ReaderClient()
+	assertClosed("ReaderClient", readErr)
+
+	assertClosed("DrainReplica", cluster.DrainReplica("replica", nil))
+	assertClosed("MarkPrimaryDown", cluster.MarkPrimaryDown(nil))
+	assertClosed("RecoverReplica", cluster.RecoverReplica(context.Background(), "replica"))
+
+	_, switchErr := cluster.SwitchPrimary(context.Background(), "replica")
+	assertClosed("SwitchPrimary", switchErr)
+
+	// Double close should also return errClusterClosed.
+	assertClosed("double Close", cluster.Close())
+}
+
+func TestClusterWithTxAfterCloseReturnError(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+
+	cluster, err := NewCluster(primary)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	_ = cluster.Close()
+
+	txErr := cluster.WithTx(context.Background(), func(_ *gorm.DB) error { return nil })
+	if !errors.Is(txErr, errClusterClosed) {
+		t.Fatalf("WithTx after close: expected errClusterClosed, got %v", txErr)
+	}
+}
+
+func TestConfigStringRedactsPassword(t *testing.T) {
+	cfg := NewConfig(
+		WithHost("10.0.0.1"),
+		WithPort("3306"),
+		WithUser("admin"),
+		WithPassword("s3cret!"),
+		WithDatabase("prod"),
+	)
+
+	str := cfg.String()
+	if str == "" {
+		t.Fatal("expected non-empty String()")
+	}
+	if contains(str, "s3cret!") {
+		t.Fatalf("String() must not contain plaintext password, got: %s", str)
+	}
+	if !contains(str, "******") {
+		t.Fatalf("String() should contain redacted password marker, got: %s", str)
+	}
+
+	goStr := cfg.GoString()
+	if contains(goStr, "s3cret!") {
+		t.Fatalf("GoString() must not contain plaintext password, got: %s", goStr)
+	}
+}
+
+func TestDefaultConfigHasPoolAndTimeoutDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.Pool.MaxOpenConns != 50 {
+		t.Fatalf("expected default MaxOpenConns=50, got %d", cfg.Pool.MaxOpenConns)
+	}
+	if cfg.Pool.MaxIdleConns != 10 {
+		t.Fatalf("expected default MaxIdleConns=10, got %d", cfg.Pool.MaxIdleConns)
+	}
+	if cfg.MySQL.ReadTimeout == 0 {
+		t.Fatal("expected non-zero default ReadTimeout")
+	}
+	if cfg.MySQL.WriteTimeout == 0 {
+		t.Fatal("expected non-zero default WriteTimeout")
+	}
+	if !cfg.Pool.hasMaxOpenConns || !cfg.Pool.hasMaxIdleConns {
+		t.Fatal("expected pool has* flags to be true in defaults")
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && searchString(s, substr)
+}
+
+func searchString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

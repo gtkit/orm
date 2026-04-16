@@ -1,6 +1,7 @@
 package orm
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -180,6 +181,96 @@ type testSetter func(*gorm.DB)
 
 func (s testSetter) Set(db *gorm.DB) {
 	s(db)
+}
+
+func TestDefaultOptionsHavePoolAndTimeoutDefaults(t *testing.T) {
+	resetLegacyConfig(t)
+
+	// Reset to pure defaults.
+	MysqlConfig()
+
+	opts := mysqlOptionsSnapshot()
+
+	if !opts.hasMaxOpenConns || opts.maxOpenConns != 50 {
+		t.Fatalf("expected default maxOpenConns=50, got %d (has=%v)", opts.maxOpenConns, opts.hasMaxOpenConns)
+	}
+	if !opts.hasMaxIdleConns || opts.maxIdleConns != 10 {
+		t.Fatalf("expected default maxIdleConns=10, got %d (has=%v)", opts.maxIdleConns, opts.hasMaxIdleConns)
+	}
+	if !opts.hasConnMaxLifetime || opts.connMaxLifetime != 30*time.Minute {
+		t.Fatalf("expected default connMaxLifetime=30m, got %v", opts.connMaxLifetime)
+	}
+	if !opts.hasConnMaxIdleTime || opts.connMaxIdleTime != 10*time.Minute {
+		t.Fatalf("expected default connMaxIdleTime=10m, got %v", opts.connMaxIdleTime)
+	}
+}
+
+func TestDSNIncludesReadWriteTimeouts(t *testing.T) {
+	resetLegacyConfig(t)
+	MysqlConfig()
+
+	dsn := new(Mysql).GetConnect()
+	if !strings.Contains(dsn, "readTimeout=") {
+		t.Fatalf("expected DSN to include readTimeout, got %q", dsn)
+	}
+	if !strings.Contains(dsn, "writeTimeout=") {
+		t.Fatalf("expected DSN to include writeTimeout, got %q", dsn)
+	}
+}
+
+func TestRedactedDSNHidesPassword(t *testing.T) {
+	resetLegacyConfig(t)
+
+	MysqlConfig(
+		User("admin"),
+		WithPassword("s3cret!"),
+		Name("prod"),
+	)
+
+	redacted := RedactedDSN()
+	if strings.Contains(redacted, "s3cret!") {
+		t.Fatalf("RedactedDSN must not contain plaintext password, got: %s", redacted)
+	}
+	if !strings.Contains(redacted, "******") {
+		t.Fatalf("RedactedDSN should contain redacted marker, got: %s", redacted)
+	}
+}
+
+func TestOptionsStringRedactsPassword(t *testing.T) {
+	opts := options{
+		Username: "admin",
+		Password: "s3cret!",
+		Host:     "10.0.0.1",
+		Port:     "3306",
+		DbName:   "prod",
+	}
+
+	str := opts.String()
+	if strings.Contains(str, "s3cret!") {
+		t.Fatalf("options.String() must not contain password, got: %s", str)
+	}
+	if !strings.Contains(str, "******") {
+		t.Fatalf("options.String() should contain redacted marker, got: %s", str)
+	}
+}
+
+func TestPasswordFieldExcludedFromJSON(t *testing.T) {
+	opts := options{
+		Username: "admin",
+		Password: "s3cret!",
+		Host:     "10.0.0.1",
+		Port:     "3306",
+		DbName:   "prod",
+	}
+
+	// json:"-" tag should prevent Password from appearing.
+	data, err := json.Marshal(opts)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "s3cret!") {
+		t.Fatalf("json.Marshal must not include password, got: %s", data)
+	}
 }
 
 func resetLegacyConfig(t *testing.T) {

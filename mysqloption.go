@@ -2,13 +2,20 @@ package orm
 
 import "time"
 
+const (
+	defaultMaxOpenConns    = 50
+	defaultMaxIdleConns    = 10
+	defaultConnMaxLifetime = 30 * time.Minute
+	defaultConnMaxIdleTime = 10 * time.Minute
+)
+
 type options struct {
-	DbType   string
-	Host     string
-	Port     string
-	DbName   string
-	Username string
-	Password string
+	DbType   string `json:"db_type"  yaml:"db_type"`
+	Host     string `json:"host"     yaml:"host"`
+	Port     string `json:"port"     yaml:"port"`
+	DbName   string `json:"db_name"  yaml:"db_name"`
+	Username string `json:"username" yaml:"username"`
+	Password string `json:"-"        yaml:"-"`
 
 	maxOpenConns    int
 	maxIdleConns    int
