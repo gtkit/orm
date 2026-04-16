@@ -18,6 +18,7 @@ go get github.com/gtkit/orm/v2
 - **Trace ID 链路追踪** — `WithTraceIDExtractor` 将请求 ID 注入每条 SQL 日志
 - **健康检查 & 指标** — Ping 探活 + 10 项连接池指标，超时可配置
 - **读写路由** — Round-robin 副本负载均衡，可回退主库，副本自动恢复
+- **读写一致性** — `ContextWithWriteFlag` 标记写后 context，后续读自动走主库，零额外开销
 - **显式拓扑切换** — 外部 HA 系统完成切换后，`SwitchPrimary()` 更新路由视图
 - **Replica 并行打开** — 集群初始化时并行连接所有副本，减少启动耗时
 
@@ -120,6 +121,32 @@ err := client.WithReadTx(ctx, func(tx *gorm.DB) error {
 err := cluster.WithTx(ctx, func(tx *gorm.DB) error { ... })
 err := cluster.WithReadTx(ctx, func(tx *gorm.DB) error { ... })
 ```
+
+## 读写一致性保护
+
+写主库后立刻从副本读可能拿到旧数据（副本有复制延迟）。通过 `ContextWithWriteFlag` 标记写后的 context，后续读请求自动路由到主库：
+
+```go
+// 1. 写操作
+err := cluster.WithTx(ctx, func(tx *gorm.DB) error {
+    return tx.Create(&order).Error
+})
+
+// 2. 标记写后 context
+ctx = orm.ContextWithWriteFlag(ctx)
+
+// 3. 后续读走主库，保证读到最新数据
+client, err := cluster.ReaderClientCtx(ctx)
+client.DB().WithContext(ctx).First(&order, orderID)
+```
+
+**性能影响：零。** 无 write flag 时 `ReaderClientCtx` 与 `ReaderClient` 耗时完全一致（~27ns），有 write flag 时反而更快（~15ns，跳过副本遍历）。
+
+| 方法 | 适用场景 |
+|------|---------|
+| `ReaderClient()` | 普通读，无需 context |
+| `ReaderClientCtx(ctx)` | 需要读写一致性保护的读 |
+| `HasWriteFlag(ctx)` | 检查当前 context 是否有写标记 |
 
 ## Trace ID 链路追踪
 

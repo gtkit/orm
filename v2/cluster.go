@@ -238,11 +238,30 @@ func (c *Cluster) Reader() *Client {
 }
 
 func (c *Cluster) ReaderClient() (*Client, error) {
+	return c.readerClient(false)
+}
+
+// ReaderClientCtx returns a read client, respecting the write flag in ctx.
+// If [ContextWithWriteFlag] was called on ctx, reads are routed to the
+// primary to guarantee read-after-write consistency.
+func (c *Cluster) ReaderClientCtx(ctx context.Context) (*Client, error) {
+	return c.readerClient(HasWriteFlag(ctx))
+}
+
+func (c *Cluster) readerClient(forcePrimary bool) (*Client, error) {
 	c.mu.RLock()
 	if c.closed {
 		c.mu.RUnlock()
 		return nil, errClusterClosed
 	}
+
+	// Fast path: write flag set — route to primary for read-after-write consistency.
+	if forcePrimary && c.primary != nil && c.primary.state == NodeStateReady {
+		client := c.primary.client
+		c.mu.RUnlock()
+		return client, nil
+	}
+
 	candidates := c.readyReplicasLocked()
 	readFallback := c.options.readFallbackToPrimary
 	// Capture primary state inside lock to avoid data race.
@@ -294,6 +313,18 @@ func (c *Cluster) WriteDB() *gorm.DB {
 // cause nil-pointer panics if the caller does not check.
 func (c *Cluster) ReadDB() *gorm.DB {
 	client, _ := c.ReaderClient()
+	if client == nil {
+		return nil
+	}
+	return client.DB()
+}
+
+// ReadDBCtx returns a *gorm.DB for reads, routing to primary when ctx
+// carries a write flag set by [ContextWithWriteFlag].
+//
+// Deprecated: Use ReaderClientCtx() instead to handle errors explicitly.
+func (c *Cluster) ReadDBCtx(ctx context.Context) *gorm.DB {
+	client, _ := c.ReaderClientCtx(ctx)
 	if client == nil {
 		return nil
 	}

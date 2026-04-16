@@ -51,6 +51,56 @@ func BenchmarkClusterReadDB(b *testing.B) {
 	}
 }
 
+// BenchmarkClusterReaderClientCtx measures read routing with context check (no write flag).
+func BenchmarkClusterReaderClientCtx(b *testing.B) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	r1DB, _ := newStubDB()
+	defer r1DB.Close()
+
+	primary, _ := OpenWithDB(context.Background(), primaryDB,
+		WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	r1, _ := OpenWithDB(context.Background(), r1DB,
+		WithName("r1"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+
+	cluster, err := NewCluster(primary, r1)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = cluster.ReaderClientCtx(ctx)
+	}
+}
+
+// BenchmarkClusterReaderClientCtxWriteFlag measures read routing with write flag set.
+func BenchmarkClusterReaderClientCtxWriteFlag(b *testing.B) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	r1DB, _ := newStubDB()
+	defer r1DB.Close()
+
+	primary, _ := OpenWithDB(context.Background(), primaryDB,
+		WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	r1, _ := OpenWithDB(context.Background(), r1DB,
+		WithName("r1"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+
+	cluster, err := NewCluster(primary, r1)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	ctx := ContextWithWriteFlag(context.Background())
+
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = cluster.ReaderClientCtx(ctx)
+	}
+}
+
 // BenchmarkClusterReadDBParallel measures read routing under contention.
 func BenchmarkClusterReadDBParallel(b *testing.B) {
 	primaryDB, _ := newStubDB()

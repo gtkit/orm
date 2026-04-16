@@ -412,6 +412,67 @@ func TestReaderClientWithoutFallbackReturnsError(t *testing.T) {
 	}
 }
 
+func TestReaderClientCtxRoutesToPrimaryOnWriteFlag(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, _ := newStubDB()
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB,
+		WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB,
+		WithName("replica"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	// Without write flag — reads go to replica.
+	client, err := cluster.ReaderClientCtx(context.Background())
+	if err != nil {
+		t.Fatalf("ReaderClientCtx() error = %v", err)
+	}
+	if client.Name() != "replica" {
+		t.Fatalf("expected replica without write flag, got %q", client.Name())
+	}
+
+	// With write flag — reads route to primary.
+	ctx := ContextWithWriteFlag(context.Background())
+	client, err = cluster.ReaderClientCtx(ctx)
+	if err != nil {
+		t.Fatalf("ReaderClientCtx(writeFlag) error = %v", err)
+	}
+	if client.Name() != "primary" {
+		t.Fatalf("expected primary with write flag, got %q", client.Name())
+	}
+
+	// ReaderClient (no ctx) still routes to replica — backward compatible.
+	client, err = cluster.ReaderClient()
+	if err != nil {
+		t.Fatalf("ReaderClient() error = %v", err)
+	}
+	if client.Name() != "replica" {
+		t.Fatalf("expected replica from ReaderClient(), got %q", client.Name())
+	}
+}
+
+func TestHasWriteFlagDefaultFalse(t *testing.T) {
+	if HasWriteFlag(context.Background()) {
+		t.Fatal("expected false for plain context")
+	}
+	ctx := ContextWithWriteFlag(context.Background())
+	if !HasWriteFlag(ctx) {
+		t.Fatal("expected true after ContextWithWriteFlag")
+	}
+}
+
 func TestClusterOperationsAfterCloseReturnError(t *testing.T) {
 	primaryDB, _ := newStubDB()
 	defer primaryDB.Close()
