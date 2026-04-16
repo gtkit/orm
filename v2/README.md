@@ -205,6 +205,83 @@ client, err := orm.OpenWithDB(ctx, existingSQLDB,
 // Close() 不会关闭外部传入的 *sql.DB
 ```
 
+## 与 sqlc / go-jet 配合使用
+
+本包只管连接，查询层可自由选择。通过 `SQLDB()` 获取底层 `*sql.DB`，即可接入任何查询工具：
+
+### sqlc
+
+```go
+// sqlc 从 SQL 文件生成类型安全的 Go 代码，性能等同原生 database/sql。
+// 安装: go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
+
+// 单节点
+client, _ := orm.Open(ctx, orm.WithHost("127.0.0.1"), ...)
+queries := db.New(client.SQLDB())
+
+order, err := queries.GetOrder(ctx, orderID)
+```
+
+### go-jet
+
+```go
+// go-jet 从数据库 schema 生成类型安全的 Go DSL，编译时检查字段名和类型。
+// 安装: go install github.com/go-jet/jet/v2/cmd/jet@latest
+
+client, _ := orm.Open(ctx, orm.WithHost("127.0.0.1"), ...)
+
+stmt := SELECT(Orders.AllColumns).
+    FROM(Orders).
+    WHERE(Orders.ID.EQ(Int64(orderID)))
+
+var order model.Orders
+err := stmt.Query(client.SQLDB(), &order)
+```
+
+### 集群模式 — 读写分离
+
+```go
+cluster, _ := orm.OpenCluster(ctx, primaryCfg, replicaCfg)
+
+// 写走主库
+writeDB := cluster.Primary().SQLDB()
+writeQueries := db.New(writeDB)
+writeQueries.CreateOrder(ctx, params)
+
+// 读走副本
+readDB := cluster.Reader().SQLDB()
+readQueries := db.New(readDB)
+orders, _ := readQueries.ListOrders(ctx)
+
+// 写后读一致性 — 走主库
+ctx = orm.ContextWithWriteFlag(ctx)
+reader, _ := cluster.ReaderClientCtx(ctx)
+consistentQueries := db.New(reader.SQLDB())
+order, _ := consistentQueries.GetOrder(ctx, orderID)
+```
+
+### 混合使用 GORM + sqlc
+
+```go
+client, _ := orm.Open(ctx, ...)
+
+// 简单 CRUD 用 GORM
+client.DB().Create(&user)
+
+// 热路径复杂查询用 sqlc（零反射开销）
+queries := db.New(client.SQLDB())
+stats, _ := queries.GetDashboardStats(ctx)
+```
+
+### 性能选型参考
+
+| 方案 | 性能 | 适合场景 |
+|------|------|---------|
+| GORM | 基准 | 标准 CRUD、快速开发 |
+| GORM `db.Raw()` | ≈原生 | GORM 项目中的少量热路径 |
+| sqlc | ≈原生 | SQL 先行、高 QPS 热路径 |
+| go-jet | 接近原生 | 复杂动态查询、类型安全 |
+
 ## 设计原则
 
 - 主从拓扑切换交给数据库平台或外部 HA 系统
