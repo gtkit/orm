@@ -12,6 +12,7 @@ type stubDBState struct {
 	pingHook      func()
 	beginErr      error
 	commitErr     error
+	commitErrOnce error // returned once on first commit, then cleared
 	rollbackErr   error
 	pingCount     atomic.Int32
 	beginCount    atomic.Int32
@@ -129,6 +130,11 @@ type stubTx struct {
 func (t *stubTx) Commit() error {
 	if t.state != nil {
 		t.state.commitCount.Add(1)
+		if t.state.commitErrOnce != nil {
+			err := t.state.commitErrOnce
+			t.state.commitErrOnce = nil
+			return err
+		}
 		if t.state.commitErr != nil {
 			return t.state.commitErr
 		}

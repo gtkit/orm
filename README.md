@@ -1,17 +1,25 @@
 # orm
 
-根模块保留旧版兼容 API。
+Go GORM MySQL 连接管理工具。提供开箱即用的连接配置、连接池管理和日志集成。
 
-生产项目请直接使用 [`github.com/gtkit/orm/v2`](./v2)。
+如需集群读写路由、健康检查、主节点切换，请使用 [`github.com/gtkit/orm/v2`](./v2)。
 
-## 当前状态
+## 安装
 
-- 根模块: 兼容层，不再继续扩展架构能力
-- `v2`: 生产主线
-- 内置日志适配: 只保留 `zap`
-- 不再提供 `slog` 适配
+```bash
+go get github.com/gtkit/orm
+```
 
-## 旧版用法
+## 特性
+
+- 全局配置，一行初始化
+- 安全的连接池默认值（MaxOpen=50, MaxIdle=10, Lifetime=30m, IdleTime=10m）
+- 读写超时默认值（ReadTimeout=30s, WriteTimeout=30s）
+- 密码防泄露（JSON/YAML 序列化自动隐藏，`String()` 自动脱敏）
+- Zap 日志适配，支持慢查询检测和 Trace ID 链路追踪
+- `RedactedDSN()` 安全日志输出
+
+## 快速开始
 
 ```go
 package main
@@ -45,6 +53,7 @@ func main() {
 			ormzap.New(
 				ormzap.WithLogLevel(gormlogger.Warn),
 				ormzap.WithSlowThreshold(200*time.Millisecond),
+				ormzap.WithIgnoreRecordNotFoundError(true),
 			),
 		),
 		orm.SingularTable(true),
@@ -60,8 +69,45 @@ func main() {
 }
 ```
 
-## 迁移建议
+## 带 Close 的用法
 
-- 新项目不要再基于根模块扩展
-- 多实例、多数据库、连接池生命周期管理请切换到 `v2`
-- 如果你需要线上可维护的读写路由、健康检查和显式拓扑切换，只用 `v2`
+```go
+result, err := orm.OpenMysqlWithClose()
+if err != nil {
+    panic(err)
+}
+defer result.Close()
+
+db := result.DB
+```
+
+## Trace ID 链路追踪
+
+```go
+ormzap.New(
+    ormzap.WithLogger(myZapLogger),
+    ormzap.WithTraceIDExtractor(func(ctx context.Context) string {
+        if id, ok := ctx.Value("X-Request-ID").(string); ok {
+            return id
+        }
+        return ""
+    }),
+)
+```
+
+所有 SQL 日志将自动携带 `trace_id` 字段。
+
+## v1 与 v2 对比
+
+| 能力 | v1 | v2 |
+|------|----|----|
+| 单节点连接 | ✅ | ✅ |
+| 连接池管理 | ✅ | ✅ |
+| Zap 日志 | ✅ | ✅ |
+| Trace ID | ✅ | ✅ |
+| 密码防泄露 | ✅ | ✅ |
+| 死锁自动重试 | - | ✅ |
+| 集群读写路由 | - | ✅ |
+| 健康检查 | - | ✅ |
+| 主节点切换 | - | ✅ |
+| 多实例 | - | ✅ |

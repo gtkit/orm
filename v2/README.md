@@ -1,208 +1,185 @@
 # orm/v2
 
-`v2` 是这个仓库唯一面向生产使用的实现。
+生产级 Go GORM MySQL 连接管理，支持单节点和集群模式。
 
-它负责:
+## 安装
 
-- 单节点 MySQL/GORM 连接管理
-- 连接池配置
-- 事务包装
-- 健康检查和连接池指标
-- 已知主从拓扑下的读写路由
-- 运维显式触发的主节点切换
+```bash
+go get github.com/gtkit/orm/v2
+```
 
-它不负责:
+## 特性
 
-- 自动故障转移
-- 自动升主
-- 真正的数据库拓扑编排
+- **单节点 & 集群** — 统一的 Client 抽象，按需扩展到读写分离
+- **安全默认值** — 连接池（MaxOpen=50, MaxIdle=10）、读写超时（30s）、健康检查超时（5s）
+- **密码防泄露** — JSON/YAML 序列化自动隐藏，`String()`/`GoString()` 自动脱敏
+- **死锁自动重试** — `WithTx` 检测 MySQL 1213/1205 自动重试，指数退避 + 随机抖动
+- **并发安全** — epoch 机制防止 TOCTOU 竞态，所有共享状态锁内访问
+- **Trace ID 链路追踪** — `WithTraceIDExtractor` 将请求 ID 注入每条 SQL 日志
+- **健康检查 & 指标** — Ping 探活 + 10 项连接池指标，超时可配置
+- **读写路由** — Round-robin 副本负载均衡，可回退主库，副本自动恢复
+- **显式拓扑切换** — 外部 HA 系统完成切换后，`SwitchPrimary()` 更新路由视图
+- **Replica 并行打开** — 集群初始化时并行连接所有副本，减少启动耗时
 
-如果你需要数据库级别的主从切换，请交给外部 HA 编排系统；应用侧只在拓扑已经切换完成后调用 `SwitchPrimary()` 更新路由视图。
+## 快速开始
 
-## 依赖要求
-
-- Go `1.26`
-
-## 单节点示例
+### 单节点
 
 ```go
-package main
-
-import (
-	"context"
-	"time"
-
-	orm "github.com/gtkit/orm/v2"
-	ormzap "github.com/gtkit/orm/v2/zlogger"
-	gormlogger "gorm.io/gorm/logger"
+client, err := orm.Open(
+    context.Background(),
+    orm.WithHost("127.0.0.1"),
+    orm.WithPort("3306"),
+    orm.WithDatabase("orders"),
+    orm.WithUser("root"),
+    orm.WithPassword("secret"),
+    orm.WithPrepareStmt(true),
+    orm.WithSkipDefaultTransaction(true),
+    orm.WithGormLogger(
+        ormzap.New(
+            ormzap.WithLogLevel(gormlogger.Warn),
+            ormzap.WithSlowThreshold(200*time.Millisecond),
+            ormzap.WithIgnoreRecordNotFoundError(true),
+            ormzap.WithParameterizedQueries(true),
+        ),
+    ),
 )
-
-func main() {
-	client, err := orm.Open(
-		context.Background(),
-		orm.WithName("orders-primary"),
-		orm.WithHost("127.0.0.1"),
-		orm.WithPort("3306"),
-		orm.WithDatabase("orders"),
-		orm.WithUser("root"),
-		orm.WithPassword("secret"),
-		orm.WithMaxOpenConns(50),
-		orm.WithMaxIdleConns(10),
-		orm.WithConnMaxLifetime(30*time.Minute),
-		orm.WithConnMaxIdleTime(10*time.Minute),
-		orm.WithPrepareStmt(true),
-		orm.WithSkipDefaultTransaction(true),
-		orm.WithGormLogger(
-			ormzap.New(
-				ormzap.WithLogLevel(gormlogger.Warn),
-				ormzap.WithSlowThreshold(200*time.Millisecond),
-				ormzap.WithIgnoreRecordNotFoundError(true),
-				ormzap.WithParameterizedQueries(true),
-			),
-		),
-	)
-	if err != nil {
-		panic(err)
-	}
-	defer client.Close()
-
-	_ = client.DB()
+if err != nil {
+    panic(err)
 }
+defer client.Close()
+
+db := client.DB() // *gorm.DB
 ```
 
-## 外部连接池包装
-
-如果你的项目已经自行管理 `*sql.DB`，可以直接包装:
-
-```go
-client, err := orm.OpenWithDB(
-	context.Background(),
-	sqlDB,
-	orm.WithName("legacy-primary"),
-	orm.WithStartupPing(false),
-	orm.WithSkipInitializeWithVersion(true),
-)
-```
-
-`OpenWithDB()` 不会接管外部 `*sql.DB` 的关闭动作。
-
-## Cluster 模式
-
-### 创建
+### 集群模式
 
 ```go
 primary := orm.NewConfig(
-	orm.WithName("primary"),
-	orm.WithHost("10.0.0.10"),
-	orm.WithDatabase("app"),
-	orm.WithUser("root"),
-	orm.WithPassword("secret"),
+    orm.WithName("primary"),
+    orm.WithHost("10.0.0.10"),
+    orm.WithDatabase("app"),
+    orm.WithUser("root"),
+    orm.WithPassword("secret"),
 )
 
 replicaA := orm.NewConfig(
-	orm.WithName("replica-a"),
-	orm.WithHost("10.0.0.11"),
-	orm.WithDatabase("app"),
-	orm.WithUser("root"),
-	orm.WithPassword("secret"),
+    orm.WithName("replica-a"),
+    orm.WithHost("10.0.0.11"),
+    orm.WithDatabase("app"),
+    orm.WithUser("root"),
+    orm.WithPassword("secret"),
 )
 
 cluster, err := orm.OpenCluster(context.Background(), primary, replicaA)
 if err != nil {
-	panic(err)
+    panic(err)
 }
 defer cluster.Close()
+
+writeDB := cluster.WriteDB()
+readDB := cluster.ReadDB()
 ```
 
-### 默认行为
-
-- 写流量永远走当前 primary
-- 读流量优先走健康 replica
-- 没有健康 replica 时，可回退到 primary
-- `Refresh()` 只刷新节点状态，不会自动切主
-
-### 显式配置
+### 集群选项
 
 ```go
 cluster, err := orm.OpenClusterWithOptions(
-	context.Background(),
-	primary,
-	[]orm.Config{replicaA},
-	orm.WithReadFallbackToPrimary(true),
-	orm.WithAutoRecoverReplicas(true),
+    context.Background(),
+    primary,
+    []orm.Config{replicaA, replicaB},
+    orm.WithReadFallbackToPrimary(true),    // 无健康副本时回退主库（默认: true）
+    orm.WithAutoRecoverReplicas(true),      // Refresh 时自动恢复副本（默认: true）
+    orm.WithHealthCheckTimeout(5*time.Second), // 健康检查超时（默认: 5s）
 )
 ```
 
-### 读写路由
+## 事务 & 死锁重试
 
 ```go
-writeDB := cluster.WriteDB()
-readDB := cluster.ReadDB()
-_, _ = writeDB, readDB
+// 默认：死锁自动重试 3 次，指数退避 5ms-50ms
+err := client.WithTx(ctx, nil, func(tx *gorm.DB) error {
+    return tx.Create(&order).Error
+})
+
+// 自定义重试策略
+err := client.WithTx(ctx, nil, fn,
+    orm.WithMaxRetries(5),
+    orm.WithRetryBaseWait(10*time.Millisecond),
+)
+
+// 禁用重试
+err := client.WithTx(ctx, nil, fn, orm.WithMaxRetries(0))
+
+// 只读事务
+err := client.WithReadTx(ctx, func(tx *gorm.DB) error {
+    return tx.Find(&users).Error
+})
+
+// 集群事务 — 写事务走主库，读事务走副本
+err := cluster.WithTx(ctx, func(tx *gorm.DB) error { ... })
+err := cluster.WithReadTx(ctx, func(tx *gorm.DB) error { ... })
 ```
 
-### 健康刷新
+## Trace ID 链路追踪
 
 ```go
-report := cluster.Refresh(context.Background())
-if report.Status == orm.HealthStatusDown {
-	// 当前主节点不可写
-}
+ormzap.New(
+    ormzap.WithLogger(myZapLogger),
+    ormzap.WithTraceIDExtractor(func(ctx context.Context) string {
+        if id, ok := ctx.Value("X-Request-ID").(string); ok {
+            return id
+        }
+        return ""
+    }),
+)
 ```
 
-### 副本摘除与恢复
+所有 SQL 日志将自动携带 `trace_id` 字段，可关联请求链路。
+
+## 健康检查 & 指标
 
 ```go
-if err := cluster.DrainReplica("replica-a", errors.New("replication lag")); err != nil {
-	panic(err)
-}
+// 单节点
+report := client.HealthCheck(ctx)
+metrics := client.Metrics()
 
-if err := cluster.RecoverReplica(context.Background(), "replica-a"); err != nil {
-	panic(err)
-}
+// 集群
+report := cluster.HealthCheck(ctx) // 并行探测所有节点
+report := cluster.Refresh(ctx)     // 探测 + 更新节点状态
+metrics := cluster.Metrics()       // 所有节点指标
 ```
 
-### 主节点不可用
+指标列表：`orm_db_max_open_connections`, `orm_db_open_connections`, `orm_db_in_use_connections`, `orm_db_idle_connections`, `orm_db_wait_count_total`, `orm_db_wait_duration_seconds_total`, `orm_db_max_idle_closed_total`, `orm_db_max_idle_time_closed_total`, `orm_db_max_lifetime_closed_total`, `orm_db_connection_utilization`
 
-如果业务或运维已经确认当前主节点不可写，可以显式标记:
+## 运维操作
 
 ```go
-if err := cluster.MarkPrimaryDown(errors.New("write timeout")); err != nil {
-	panic(err)
-}
+// 摘除副本
+cluster.DrainReplica("replica-a", errors.New("replication lag"))
+
+// 恢复副本
+cluster.RecoverReplica(ctx, "replica-a")
+
+// 标记主库不可用（不会自动切主）
+cluster.MarkPrimaryDown(errors.New("write timeout"))
+
+// 外部 HA 完成切换后，更新应用路由
+cluster.SwitchPrimary(ctx, "replica-a")
 ```
 
-这只会停止应用继续把写流量发往当前 primary，不会自动切主。
-
-### 外部编排后的主节点切换
-
-当外部系统已经完成数据库拓扑切换后，应用侧显式更新路由:
+## 外部连接池包装
 
 ```go
-node, err := cluster.SwitchPrimary(context.Background(), "replica-a")
-if err != nil {
-	panic(err)
-}
-
-_ = node
+client, err := orm.OpenWithDB(ctx, existingSQLDB,
+    orm.WithName("legacy"),
+    orm.WithStartupPing(false),
+)
+// Close() 不会关闭外部传入的 *sql.DB
 ```
 
-`SwitchPrimary()` 只更新应用内的读写路由视图。它不会修改数据库的真实角色。
+## 设计原则
 
-## logger
-
-只保留 `zap` 适配:
-
-- `WithLogger`
-- `WithLogLevel`
-- `WithSlowThreshold`
-- `WithIgnoreRecordNotFoundError`
-- `WithParameterizedQueries`
-
-`LogMode()` 语义与 GORM 保持一致，`db.Debug()` 也会生效。
-
-## 生产建议
-
-- 主从拓扑切换交给数据库平台或外部编排系统
+- 主从拓扑切换交给数据库平台或外部 HA 系统
 - 应用侧只负责连接管理、健康检查、读写路由和显式拓扑同步
-- 需要更重的读写分离能力时，可以评估 GORM 官方 `DBResolver`
+- `SwitchPrimary()` 只更新应用内路由视图，不修改数据库真实角色

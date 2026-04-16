@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -131,6 +132,125 @@ func TestClientHealthCheckDown(t *testing.T) {
 	}
 	if report.Error == nil {
 		t.Fatalf("expected health error")
+	}
+}
+
+func TestWithTxRetriesOnDeadlock(t *testing.T) {
+	mysqlDeadlock := &mysqldriver.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
+
+	sqlDB, state := newStubDB()
+	state.commitErrOnce = mysqlDeadlock // first commit fails with deadlock
+	defer sqlDB.Close()
+
+	client, err := OpenWithDB(context.Background(), sqlDB,
+		WithName("retry-test"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+
+	callCount := 0
+	txErr := client.WithTx(context.Background(), nil, func(_ *gorm.DB) error {
+		callCount++
+		return nil
+	})
+	if txErr != nil {
+		t.Fatalf("WithTx() expected success after retry, got %v", txErr)
+	}
+	// fn called twice: first attempt deadlocks on commit, second succeeds.
+	if callCount != 2 {
+		t.Fatalf("expected fn called 2 times (1 deadlock + 1 success), got %d", callCount)
+	}
+	// 2 begins, 2 commits (1 failed + 1 success), 1 rollback from deadlock.
+	if got := state.beginCount.Load(); got != 2 {
+		t.Fatalf("expected begin count 2, got %d", got)
+	}
+	if got := state.commitCount.Load(); got != 2 {
+		t.Fatalf("expected commit count 2, got %d", got)
+	}
+}
+
+func TestWithTxNoRetryOnNonDeadlock(t *testing.T) {
+	sqlDB, _ := newStubDB()
+	defer sqlDB.Close()
+
+	client, err := OpenWithDB(context.Background(), sqlDB,
+		WithName("no-retry"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+
+	businessErr := errors.New("validation failed")
+	callCount := 0
+	txErr := client.WithTx(context.Background(), nil, func(_ *gorm.DB) error {
+		callCount++
+		return businessErr
+	})
+	if !errors.Is(txErr, businessErr) {
+		t.Fatalf("expected business error, got %v", txErr)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected fn called once (no retry for non-deadlock), got %d", callCount)
+	}
+}
+
+func TestWithTxRetriesExhausted(t *testing.T) {
+	mysqlDeadlock := &mysqldriver.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
+
+	sqlDB, state := newStubDB()
+	state.commitErr = mysqlDeadlock // every commit fails
+	defer sqlDB.Close()
+
+	client, err := OpenWithDB(context.Background(), sqlDB,
+		WithName("exhaust"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+
+	callCount := 0
+	txErr := client.WithTx(context.Background(), nil, func(_ *gorm.DB) error {
+		callCount++
+		return nil
+	}, WithMaxRetries(2), WithRetryBaseWait(time.Millisecond))
+
+	if txErr == nil {
+		t.Fatal("expected error after retries exhausted")
+	}
+	// 1 initial + 2 retries = 3 calls.
+	if callCount != 3 {
+		t.Fatalf("expected fn called 3 times, got %d", callCount)
+	}
+	if got := state.beginCount.Load(); got != 3 {
+		t.Fatalf("expected begin count 3, got %d", got)
+	}
+}
+
+func TestWithTxZeroRetriesDisablesRetry(t *testing.T) {
+	mysqlDeadlock := &mysqldriver.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
+
+	sqlDB, state := newStubDB()
+	state.commitErr = mysqlDeadlock
+	defer sqlDB.Close()
+
+	client, err := OpenWithDB(context.Background(), sqlDB,
+		WithName("no-retry"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+
+	callCount := 0
+	txErr := client.WithTx(context.Background(), nil, func(_ *gorm.DB) error {
+		callCount++
+		return nil
+	}, WithMaxRetries(0))
+
+	if txErr == nil {
+		t.Fatal("expected deadlock error")
+	}
+	if callCount != 1 {
+		t.Fatalf("expected fn called once with retries disabled, got %d", callCount)
+	}
+	if got := state.beginCount.Load(); got != 1 {
+		t.Fatalf("expected begin count 1, got %d", got)
 	}
 }
 

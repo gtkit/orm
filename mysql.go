@@ -1,9 +1,8 @@
 // Package orm provides a GORM-based MySQL connection wrapper.
 //
-// Deprecated: This is the v1 API. Use [github.com/gtkit/orm/v2] instead,
-// which provides per-instance configuration, cluster failover, health checks,
-// and better concurrency safety. v1 relies on global mutable state and will
-// only receive critical bug fixes going forward.
+// For single-node use cases, v1 provides a simple global-config API.
+// For cluster failover, health checks, and per-instance configuration,
+// see [github.com/gtkit/orm/v2].
 package orm
 
 import (
@@ -49,9 +48,8 @@ func defaultMysqlOptions() options {
 }
 
 // NewMysql creates a GORM DB instance or panics on failure.
-//
-// Deprecated: Use OpenMysql instead and handle errors explicitly.
-// Panicking in production services can cause cascading failures.
+// Use only during application startup (e.g. in main or init).
+// For production services that need graceful error handling, prefer [OpenMysql].
 func NewMysql(setter ...Setter) *gorm.DB {
 	db, err := OpenMysql(setter...)
 	if err != nil {

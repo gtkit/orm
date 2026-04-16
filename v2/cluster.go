@@ -320,12 +320,12 @@ func (c *Cluster) MustReadDB() *gorm.DB {
 	return client.DB()
 }
 
-func (c *Cluster) WithTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
+func (c *Cluster) WithTx(ctx context.Context, fn func(tx *gorm.DB) error, txOpts ...TxOption) error {
 	client, err := c.WriteClient()
 	if err != nil {
 		return err
 	}
-	return client.WithTx(ctx, nil, fn)
+	return client.WithTx(ctx, nil, fn, txOpts...)
 }
 
 func (c *Cluster) WithReadTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
