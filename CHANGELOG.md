@@ -8,6 +8,7 @@
 
 ### 新增
 
+- 新增 `jetorm` 子包，提供面向 `go-jet` 的 MySQL 连接管理、事务包装和执行辅助
 - `orm/v2` 新增自定义健康探针 `WithHealthProbe(...)`
 - `orm/v2` 新增显式健康循环 `RunHealthLoop(ctx, interval)`
 - `orm/v2` 新增写后读窗口与清除语义：

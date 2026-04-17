@@ -4,6 +4,8 @@ Go GORM MySQL 连接管理工具。提供开箱即用的连接配置、连接池
 
 如需集群读写路由、健康检查、主节点切换，请使用 [`github.com/gtkit/orm/v2`](./v2)。
 
+如果你希望保留 SQL-first 风格并接入 `go-jet`，请使用 [`github.com/gtkit/orm/jetorm`](./jetorm)。
+
 ## 安装
 
 ```bash
@@ -79,6 +81,73 @@ if err != nil {
 defer result.Close()
 
 db := result.DB
+```
+
+## go-jet 用法
+
+`jetorm` 只负责连接、连接池、事务和执行辅助，不重新抽象 `go-jet` 的查询 DSL。
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"time"
+
+	jetmysql "github.com/go-jet/jet/v2/mysql"
+
+	"github.com/gtkit/orm/jetorm"
+)
+
+func main() {
+	client, err := jetorm.Open(
+		context.Background(),
+		jetorm.WithHost("127.0.0.1"),
+		jetorm.WithPort("3306"),
+		jetorm.WithDatabase("app"),
+		jetorm.WithUser("root"),
+		jetorm.WithPassword("secret"),
+		jetorm.WithQueryTimeout(2*time.Second),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	var rows []struct {
+		ID int64
+	}
+	if err := client.QueryContext(
+		context.Background(),
+		jetmysql.RawStatement("SELECT 1 AS id"),
+		&rows,
+	); err != nil {
+		log.Fatal(err)
+	}
+
+	err = client.WithTx(context.Background(), nil, func(tx *jetorm.Tx) error {
+		_, err := tx.ExecContext(
+			context.Background(),
+			jetmysql.RawStatement("UPDATE users SET updated_at = NOW() WHERE id = 1"),
+		)
+		return err
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+### go-jet generator 约定
+
+- 生成代码建议放在业务仓库自己的 `internal/dbgen`、`.gen` 或等价目录下，不要提交到本库。
+- 这个库只提供连接与事务基础设施，不托管生成产物。
+- 示例命令：
+
+```bash
+go install github.com/go-jet/jet/v2/cmd/jet@latest
+jet -source=mysql -dsn="user:pass@tcp(127.0.0.1:3306)/app" -path=./internal/dbgen
 ```
 
 ## Trace ID 链路追踪
