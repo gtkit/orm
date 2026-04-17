@@ -183,6 +183,12 @@ func WithGormLogger(log gormlogger.Interface) Option {
 	}
 }
 
+func WithHealthProbe(probe HealthProbeFunc) Option {
+	return func(c *Config) {
+		c.HealthProbe = probe
+	}
+}
+
 func WithNowFunc(now func() time.Time) Option {
 	return func(c *Config) {
 		c.GORM.NowFunc = now
@@ -249,9 +255,29 @@ func WithStartupPing(enabled bool) Option {
 	}
 }
 
+func WithStartupPingRetry(maxRetries int, baseWait, maxWait time.Duration) Option {
+	return func(c *Config) {
+		if maxRetries >= 0 {
+			c.StartupPingMaxRetries = maxRetries
+		}
+		if baseWait > 0 {
+			c.StartupPingRetryBaseWait = baseWait
+		}
+		if maxWait > 0 {
+			c.StartupPingRetryMaxWait = maxWait
+		}
+	}
+}
+
 func WithDriverName(name string) Option {
 	return func(c *Config) {
 		c.Dialect.DriverName = name
+	}
+}
+
+func WithTxRetryObserver(observer TxRetryObserver) Option {
+	return func(c *Config) {
+		c.TxRetryObserver = observer
 	}
 }
 

@@ -1,12 +1,17 @@
 package orm
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
+	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -75,6 +80,98 @@ func TestMysqlConfigBuildsDriverDSN(t *testing.T) {
 	}
 	if cfg.Loc == nil || cfg.Loc.String() != time.Local.String() {
 		t.Fatalf("expected local location, got %v", cfg.Loc)
+	}
+}
+
+func TestOpenMysqlClosesPoolWhenApplyPoolOptionsFails(t *testing.T) {
+	resetLegacyConfig(t)
+
+	originalOpen := mysqlOpenFn
+	original := applyPoolOptionsFn
+	defer func() {
+		mysqlOpenFn = originalOpen
+		applyPoolOptionsFn = original
+	}()
+
+	sentinel := errors.New("apply pool failed")
+	var openedSQLDB *sql.DB
+	mysqlOpenFn = func(_ *Mysql, _ string, conf gorm.Config) (*gorm.DB, error) {
+		sqlDB := sql.OpenDB(&legacyStubConnector{})
+		openedSQLDB = sqlDB
+		if pingErr := sqlDB.PingContext(context.Background()); pingErr != nil {
+			t.Fatalf("expected sqlDB to open, got %v", pingErr)
+		}
+		return gorm.Open(gormmysql.New(gormmysql.Config{
+			Conn:                      sqlDB,
+			SkipInitializeWithVersion: true,
+		}), &conf)
+	}
+	applyPoolOptionsFn = func(db *gorm.DB, _ options) error {
+		sqlDB, err := db.DB()
+		if err != nil {
+			return err
+		}
+		if pingErr := sqlDB.Ping(); pingErr != nil {
+			t.Fatalf("expected sqlDB open before failure, got %v", pingErr)
+		}
+		return sentinel
+	}
+
+	db, err := OpenMysql()
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel error, got %v", err)
+	}
+	if db != nil {
+		t.Fatalf("expected nil db, got %#v", db)
+	}
+	if pingErr := openedSQLDB.PingContext(context.Background()); pingErr == nil {
+		t.Fatal("expected sqlDB to be closed after failure")
+	}
+}
+
+func TestOpenMysqlWithCloseClosesPoolWhenApplyPoolOptionsFails(t *testing.T) {
+	resetLegacyConfig(t)
+
+	originalOpen := mysqlOpenFn
+	original := applyPoolOptionsFn
+	defer func() {
+		mysqlOpenFn = originalOpen
+		applyPoolOptionsFn = original
+	}()
+
+	sentinel := errors.New("apply pool failed")
+	var openedSQLDB *sql.DB
+	mysqlOpenFn = func(_ *Mysql, _ string, conf gorm.Config) (*gorm.DB, error) {
+		sqlDB := sql.OpenDB(&legacyStubConnector{})
+		openedSQLDB = sqlDB
+		if pingErr := sqlDB.PingContext(context.Background()); pingErr != nil {
+			t.Fatalf("expected sqlDB to open, got %v", pingErr)
+		}
+		return gorm.Open(gormmysql.New(gormmysql.Config{
+			Conn:                      sqlDB,
+			SkipInitializeWithVersion: true,
+		}), &conf)
+	}
+	applyPoolOptionsFn = func(db *gorm.DB, _ options) error {
+		sqlDB, err := db.DB()
+		if err != nil {
+			return err
+		}
+		if pingErr := sqlDB.Ping(); pingErr != nil {
+			t.Fatalf("expected sqlDB open before failure, got %v", pingErr)
+		}
+		return sentinel
+	}
+
+	result, err := OpenMysqlWithClose()
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel error, got %v", err)
+	}
+	if result != nil {
+		t.Fatalf("expected nil result, got %#v", result)
+	}
+	if pingErr := openedSQLDB.PingContext(context.Background()); pingErr == nil {
+		t.Fatal("expected sqlDB to be closed after failure")
 	}
 }
 
@@ -279,4 +376,80 @@ func resetLegacyConfig(t *testing.T) {
 		MysqlConfig()
 		GormConfig()
 	})
+}
+
+type legacyStubConnector struct{}
+
+func (legacyStubConnector) Connect(context.Context) (driver.Conn, error) {
+	return legacyStubConn{}, nil
+}
+
+func (legacyStubConnector) Driver() driver.Driver {
+	return legacyStubDriver{}
+}
+
+type legacyStubDriver struct{}
+
+func (legacyStubDriver) Open(string) (driver.Conn, error) {
+	return legacyStubConn{}, nil
+}
+
+type legacyStubConn struct{}
+
+func (legacyStubConn) Prepare(string) (driver.Stmt, error) {
+	return legacyStubStmt{}, nil
+}
+
+func (legacyStubConn) Close() error {
+	return nil
+}
+
+func (legacyStubConn) Begin() (driver.Tx, error) {
+	return legacyStubTx{}, nil
+}
+
+func (legacyStubConn) Ping(context.Context) error {
+	return nil
+}
+
+type legacyStubStmt struct{}
+
+func (legacyStubStmt) Close() error {
+	return nil
+}
+
+func (legacyStubStmt) NumInput() int {
+	return 0
+}
+
+func (legacyStubStmt) Exec([]driver.Value) (driver.Result, error) {
+	return driver.RowsAffected(0), nil
+}
+
+func (legacyStubStmt) Query([]driver.Value) (driver.Rows, error) {
+	return legacyStubRows{}, nil
+}
+
+type legacyStubTx struct{}
+
+func (legacyStubTx) Commit() error {
+	return nil
+}
+
+func (legacyStubTx) Rollback() error {
+	return nil
+}
+
+type legacyStubRows struct{}
+
+func (legacyStubRows) Columns() []string {
+	return nil
+}
+
+func (legacyStubRows) Close() error {
+	return nil
+}
+
+func (legacyStubRows) Next([]driver.Value) error {
+	return driver.ErrBadConn
 }

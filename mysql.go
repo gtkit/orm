@@ -18,9 +18,11 @@ import (
 )
 
 var (
-	configMu sync.RWMutex
-	mop      = defaultMysqlOptions()
-	gop      = defaultGormConfig()
+	configMu           sync.RWMutex
+	mop                = defaultMysqlOptions()
+	gop                = defaultGormConfig()
+	mysqlOpenFn        = func(m *Mysql, conn string, conf gorm.Config) (*gorm.DB, error) { return m.open(conn, conf) }
+	applyPoolOptionsFn = applyPoolOptions
 )
 
 const (
@@ -77,7 +79,7 @@ func (r *DBResult) Close() error {
 func OpenMysqlWithClose(setter ...Setter) (*DBResult, error) {
 	mydb := new(Mysql)
 	mysqlOpts := mysqlOptionsSnapshot()
-	db, err := mydb.open(buildMySQLDSN(mysqlOpts), gormConfigSnapshot())
+	db, err := mysqlOpenFn(mydb, buildMySQLDSN(mysqlOpts), gormConfigSnapshot())
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +93,8 @@ func OpenMysqlWithClose(setter ...Setter) (*DBResult, error) {
 		return nil, err
 	}
 
-	if applyErr := applyPoolOptions(db, mysqlOpts); applyErr != nil {
+	if applyErr := applyPoolOptionsFn(db, mysqlOpts); applyErr != nil {
+		_ = sqlDB.Close()
 		return nil, applyErr
 	}
 
@@ -102,7 +105,7 @@ func OpenMysqlWithClose(setter ...Setter) (*DBResult, error) {
 func OpenMysql(setter ...Setter) (*gorm.DB, error) {
 	mydb := new(Mysql)
 	mysqlOpts := mysqlOptionsSnapshot()
-	db, err := mydb.open(buildMySQLDSN(mysqlOpts), gormConfigSnapshot())
+	db, err := mysqlOpenFn(mydb, buildMySQLDSN(mysqlOpts), gormConfigSnapshot())
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +114,13 @@ func OpenMysql(setter ...Setter) (*gorm.DB, error) {
 		return nil, db.Error
 	}
 
-	if applyErr := applyPoolOptions(db, mysqlOpts); applyErr != nil {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+
+	if applyErr := applyPoolOptionsFn(db, mysqlOpts); applyErr != nil {
+		_ = sqlDB.Close()
 		return nil, applyErr
 	}
 

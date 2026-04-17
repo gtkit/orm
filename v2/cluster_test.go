@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -203,6 +204,98 @@ func TestClusterHealthCheckDegradedWhenReplicaDown(t *testing.T) {
 	}
 }
 
+func TestClusterRefreshUsesCustomProbe(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, _ := newStubDB()
+	defer replicaDB.Close()
+
+	probeErr := errors.New("replica lag")
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(
+		context.Background(),
+		replicaDB,
+		WithName("replica"),
+		WithStartupPing(false),
+		WithSkipInitializeWithVersion(true),
+		WithHealthProbe(func(context.Context, *Client, NodeRole) error {
+			return probeErr
+		}),
+	)
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	report := cluster.Refresh(context.Background())
+	if report.Status != HealthStatusDegraded {
+		t.Fatalf("expected degraded status, got %q", report.Status)
+	}
+
+	replicas := cluster.ReplicaNodes()
+	if len(replicas) != 1 {
+		t.Fatalf("expected one replica, got %d", len(replicas))
+	}
+	if replicas[0].State() != NodeStateDown {
+		t.Fatalf("expected replica down, got %q", replicas[0].State())
+	}
+	if !errors.Is(replicas[0].LastError(), probeErr) {
+		t.Fatalf("expected probe error, got %v", replicas[0].LastError())
+	}
+}
+
+func TestClusterRunHealthLoop(t *testing.T) {
+	primaryDB, primaryState := newStubDB()
+	defer primaryDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+
+	cluster, err := NewCluster(primary)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cluster.RunHealthLoop(ctx, 10*time.Millisecond)
+	}()
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if primaryState.pingCount.Load() >= 2 {
+			cancel()
+			select {
+			case loopErr := <-done:
+				if loopErr != nil {
+					t.Fatalf("RunHealthLoop() error = %v", loopErr)
+				}
+				return
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("RunHealthLoop() did not exit after cancellation")
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	<-done
+	t.Fatalf("expected health loop to ping at least twice, got %d", primaryState.pingCount.Load())
+}
+
 func TestClusterRefreshMarksPrimaryDownWithoutSwitchingTopology(t *testing.T) {
 	primaryDB, _ := newStubDB(withStubPingError(errors.New("primary unavailable")))
 	defer primaryDB.Close()
@@ -278,6 +371,55 @@ func TestSwitchPrimaryUpdatesWriteRoutingOnlyAfterExplicitOperatorAction(t *test
 	}
 	if replicas[0].State() != NodeStateDraining {
 		t.Fatalf("expected previous primary to drain until explicitly recovered, got %q", replicas[0].State())
+	}
+}
+
+func TestSwitchPrimaryDoesNotInvalidatePreviouslyFetchedWriter(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, _ := newStubDB()
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB, WithName("replica-a"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	oldWriter, err := cluster.WriteClient()
+	if err != nil {
+		t.Fatalf("WriteClient(before switch) error = %v", err)
+	}
+	if oldWriter.Name() != "primary" {
+		t.Fatalf("expected cached writer primary, got %q", oldWriter.Name())
+	}
+
+	_, err = cluster.SwitchPrimary(context.Background(), "replica-a")
+	if err != nil {
+		t.Fatalf("SwitchPrimary() error = %v", err)
+	}
+
+	newWriter, err := cluster.WriteClient()
+	if err != nil {
+		t.Fatalf("WriteClient(after switch) error = %v", err)
+	}
+	if newWriter.Name() != "replica-a" {
+		t.Fatalf("expected fresh writer replica-a, got %q", newWriter.Name())
+	}
+
+	if oldWriter.Name() != "primary" {
+		t.Fatalf("expected previously fetched writer to remain primary, got %q", oldWriter.Name())
+	}
+	if oldWriter == newWriter {
+		t.Fatal("expected caller to re-fetch writer after switch")
 	}
 }
 
@@ -546,6 +688,150 @@ func TestReaderClientCtxRoutesToPrimaryOnWriteFlag(t *testing.T) {
 	}
 }
 
+func TestReaderClientCtxClearedWriteFlag(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, _ := newStubDB()
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB,
+		WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB,
+		WithName("replica"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	ctx := ContextClearWriteFlag(ContextWithWriteFlag(context.Background()))
+	client, err := cluster.ReaderClientCtx(ctx)
+	if err != nil {
+		t.Fatalf("ReaderClientCtx(clear) error = %v", err)
+	}
+	if client.Name() != "replica" {
+		t.Fatalf("expected replica after clear, got %q", client.Name())
+	}
+}
+
+func TestReaderClientCtxWriteWindowExpires(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, _ := newStubDB()
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB,
+		WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB,
+		WithName("replica"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	ctx := ContextWithWriteWindow(context.Background(), 20*time.Millisecond)
+	client, err := cluster.ReaderClientCtx(ctx)
+	if err != nil {
+		t.Fatalf("ReaderClientCtx(window) error = %v", err)
+	}
+	if client.Name() != "primary" {
+		t.Fatalf("expected primary before window expires, got %q", client.Name())
+	}
+
+	time.Sleep(40 * time.Millisecond)
+
+	client, err = cluster.ReaderClientCtx(ctx)
+	if err != nil {
+		t.Fatalf("ReaderClientCtx(expired window) error = %v", err)
+	}
+	if client.Name() != "replica" {
+		t.Fatalf("expected replica after window expires, got %q", client.Name())
+	}
+}
+
+func TestReaderClientCtxReturnsPrimaryUnavailableWhenWriteFlagSetAndPrimaryDown(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, _ := newStubDB()
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB,
+		WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB,
+		WithName("replica"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	if markErr := cluster.MarkPrimaryDown(errors.New("primary down")); markErr != nil {
+		t.Fatalf("MarkPrimaryDown() error = %v", markErr)
+	}
+
+	client, readErr := cluster.ReaderClientCtx(ContextWithWriteFlag(context.Background()))
+	if !errors.Is(readErr, errPrimaryUnavailable) {
+		t.Fatalf("expected errPrimaryUnavailable, got %v", readErr)
+	}
+	if client != nil {
+		t.Fatalf("expected nil client, got %v", client)
+	}
+}
+
+func TestReaderClientCtxReturnsPrimaryUnavailableWhenWriteFlagSetAndPrimaryDraining(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, _ := newStubDB()
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB,
+		WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB,
+		WithName("replica"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	cluster.mu.Lock()
+	cluster.primary.setState(NodeStateDraining, errors.New("manual drain"))
+	cluster.mu.Unlock()
+
+	client, readErr := cluster.ReaderClientCtx(ContextWithWriteFlag(context.Background()))
+	if !errors.Is(readErr, errPrimaryUnavailable) {
+		t.Fatalf("expected errPrimaryUnavailable, got %v", readErr)
+	}
+	if client != nil {
+		t.Fatalf("expected nil client, got %v", client)
+	}
+}
+
 func TestHasWriteFlagDefaultFalse(t *testing.T) {
 	if HasWriteFlag(context.Background()) {
 		t.Fatal("expected false for plain context")
@@ -603,6 +889,194 @@ func TestClusterOperationsAfterCloseReturnError(t *testing.T) {
 
 	// Double close should also return errClusterClosed.
 	assertClosed("double Close", cluster.Close())
+}
+
+func TestRecoverReplicaReturnsClusterClosedWhenClosedDuringPing(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	replicaDB, _ := newStubDB(withStubPingHook(func() {
+		once.Do(func() {
+			close(started)
+			<-release
+		})
+	}))
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB, WithName("replica"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- cluster.RecoverReplica(context.Background(), "replica")
+	}()
+
+	<-started
+	if closeErr := cluster.Close(); closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
+	close(release)
+
+	recoverErr := <-resultCh
+	if !errors.Is(recoverErr, errClusterClosed) {
+		t.Fatalf("expected errClusterClosed, got %v", recoverErr)
+	}
+}
+
+func TestSwitchPrimaryReturnsClusterClosedWhenClosedDuringPing(t *testing.T) {
+	primaryDB, _ := newStubDB()
+	defer primaryDB.Close()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	replicaDB, _ := newStubDB(withStubPingHook(func() {
+		once.Do(func() {
+			close(started)
+			<-release
+		})
+	}))
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB, WithName("replica-a"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	type switchResult struct {
+		node Node
+		err  error
+	}
+	resultCh := make(chan switchResult, 1)
+	go func() {
+		node, switchErr := cluster.SwitchPrimary(context.Background(), "replica-a")
+		resultCh <- switchResult{node: node, err: switchErr}
+	}()
+
+	<-started
+	if closeErr := cluster.Close(); closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
+	close(release)
+
+	result := <-resultCh
+	if !errors.Is(result.err, errClusterClosed) {
+		t.Fatalf("expected errClusterClosed, got %v", result.err)
+	}
+}
+
+func TestSwitchPrimaryFastPathReturnsClusterClosedWhenClosedDuringPingError(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	primaryDB, _ := newStubDB(
+		withStubPingError(errors.New("primary unavailable")),
+		withStubPingHook(func() {
+			once.Do(func() {
+				close(started)
+				<-release
+			})
+		}),
+	)
+	defer primaryDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+
+	cluster, err := NewCluster(primary)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	type switchResult struct {
+		node Node
+		err  error
+	}
+	resultCh := make(chan switchResult, 1)
+	go func() {
+		node, switchErr := cluster.SwitchPrimary(context.Background(), "primary")
+		resultCh <- switchResult{node: node, err: switchErr}
+	}()
+
+	<-started
+	if closeErr := cluster.Close(); closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
+	close(release)
+
+	result := <-resultCh
+	if !errors.Is(result.err, errClusterClosed) {
+		t.Fatalf("expected errClusterClosed, got %v", result.err)
+	}
+}
+
+func TestSwitchPrimaryFastPathReturnsClusterClosedWhenClosedAfterSuccessfulPing(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	primaryDB, _ := newStubDB(withStubPingHook(func() {
+		once.Do(func() {
+			close(started)
+			<-release
+		})
+	}))
+	defer primaryDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+
+	cluster, err := NewCluster(primary)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	type switchResult struct {
+		node Node
+		err  error
+	}
+	resultCh := make(chan switchResult, 1)
+	go func() {
+		node, switchErr := cluster.SwitchPrimary(context.Background(), "primary")
+		resultCh <- switchResult{node: node, err: switchErr}
+	}()
+
+	<-started
+	if closeErr := cluster.Close(); closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
+	close(release)
+
+	result := <-resultCh
+	if !errors.Is(result.err, errClusterClosed) {
+		t.Fatalf("expected errClusterClosed, got %v", result.err)
+	}
 }
 
 func TestClusterWithTxAfterCloseReturnError(t *testing.T) {

@@ -135,6 +135,42 @@ func TestClientHealthCheckDown(t *testing.T) {
 	}
 }
 
+func TestClientHealthCheckUsesCustomProbe(t *testing.T) {
+	sqlDB, state := newStubDB()
+	defer sqlDB.Close()
+
+	probeErr := errors.New("replica lag")
+	probeCalled := false
+
+	client, err := OpenWithDB(
+		context.Background(),
+		sqlDB,
+		WithStartupPing(false),
+		WithSkipInitializeWithVersion(true),
+		WithHealthProbe(func(context.Context, *Client, NodeRole) error {
+			probeCalled = true
+			return probeErr
+		}),
+	)
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+
+	report := client.HealthCheck(context.Background())
+	if report.Status != HealthStatusDown {
+		t.Fatalf("expected health down, got %q", report.Status)
+	}
+	if !errors.Is(report.Error, probeErr) {
+		t.Fatalf("expected probe error, got %v", report.Error)
+	}
+	if !probeCalled {
+		t.Fatal("expected custom probe to be called")
+	}
+	if got := state.pingCount.Load(); got != 1 {
+		t.Fatalf("expected ping before custom probe, got %d", got)
+	}
+}
+
 func TestClientHealthCheckAcceptsNilContext(t *testing.T) {
 	sqlDB, state := newStubDB()
 	defer sqlDB.Close()
@@ -191,6 +227,92 @@ func TestWithTxRetriesOnDeadlock(t *testing.T) {
 	}
 	if got := state.commitCount.Load(); got != 2 {
 		t.Fatalf("expected commit count 2, got %d", got)
+	}
+}
+
+func TestWithTxReportsRetryEvent(t *testing.T) {
+	mysqlDeadlock := &mysqldriver.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
+
+	sqlDB, state := newStubDB()
+	state.commitErrOnce = mysqlDeadlock
+	defer sqlDB.Close()
+
+	var events []TxRetryEvent
+	client, err := OpenWithDB(context.Background(), sqlDB,
+		WithName("retry-test"),
+		WithStartupPing(false),
+		WithSkipInitializeWithVersion(true),
+		WithTxRetryObserver(func(_ context.Context, event TxRetryEvent) {
+			events = append(events, event)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+
+	txErr := client.WithTx(context.Background(), nil, func(_ *gorm.DB) error { return nil })
+	if txErr != nil {
+		t.Fatalf("WithTx() error = %v", txErr)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 retry event, got %d", len(events))
+	}
+	if events[0].ClientName != "retry-test" {
+		t.Fatalf("expected client name retry-test, got %q", events[0].ClientName)
+	}
+	if events[0].Attempt != 1 {
+		t.Fatalf("expected attempt 1, got %d", events[0].Attempt)
+	}
+	if events[0].MaxRetries != defaultMaxRetries {
+		t.Fatalf("expected max retries %d, got %d", defaultMaxRetries, events[0].MaxRetries)
+	}
+	if events[0].Wait <= 0 {
+		t.Fatalf("expected positive wait, got %v", events[0].Wait)
+	}
+	if !errors.Is(events[0].Err, mysqlDeadlock) {
+		t.Fatalf("expected deadlock error, got %v", events[0].Err)
+	}
+}
+
+func TestWithTxRetryMaxWaitOption(t *testing.T) {
+	sqlDB, state := newStubDB()
+	state.commitErr = &mysqldriver.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
+	defer sqlDB.Close()
+
+	var events []TxRetryEvent
+	client, err := OpenWithDB(
+		context.Background(),
+		sqlDB,
+		WithName("retry-max-wait"),
+		WithStartupPing(false),
+		WithSkipInitializeWithVersion(true),
+		WithTxRetryObserver(func(_ context.Context, event TxRetryEvent) {
+			events = append(events, event)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+
+	txErr := client.WithTx(
+		context.Background(),
+		nil,
+		func(_ *gorm.DB) error { return nil },
+		WithMaxRetries(1),
+		WithRetryBaseWait(20*time.Millisecond),
+		WithRetryMaxWait(5*time.Millisecond),
+	)
+	if txErr == nil {
+		t.Fatal("expected deadlock error")
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 retry event, got %d", len(events))
+	}
+	if events[0].Wait != 5*time.Millisecond {
+		t.Fatalf("expected wait capped at 5ms, got %v", events[0].Wait)
+	}
+	if got := state.beginCount.Load(); got != 2 {
+		t.Fatalf("expected two attempts, got %d", got)
 	}
 }
 

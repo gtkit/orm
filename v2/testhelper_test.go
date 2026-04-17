@@ -9,6 +9,7 @@ import (
 
 type stubDBState struct {
 	pingErr       error
+	pingErrOnce   error
 	pingHook      func()
 	beginErr      error
 	commitErr     error
@@ -26,6 +27,12 @@ type stubDBOption func(*stubDBState)
 func withStubPingError(err error) stubDBOption {
 	return func(state *stubDBState) {
 		state.pingErr = err
+	}
+}
+
+func withStubPingErrorOnce(err error) stubDBOption {
+	return func(state *stubDBState) {
+		state.pingErrOnce = err
 	}
 }
 
@@ -101,6 +108,11 @@ func (c *stubConn) Ping(context.Context) error {
 	}
 	if c.state != nil && c.state.pingErr != nil {
 		return c.state.pingErr
+	}
+	if c.state != nil && c.state.pingErrOnce != nil {
+		err := c.state.pingErrOnce
+		c.state.pingErrOnce = nil
+		return err
 	}
 	return nil
 }

@@ -21,6 +21,7 @@ var (
 	errDuplicateNodeName  = errors.New("orm/v2: duplicate node name")
 	errClusterClosed      = errors.New("orm/v2: cluster is closed")
 	errTopologyChanged    = errors.New("orm/v2: topology changed during operation, retry")
+	errHealthLoopInterval = errors.New("orm/v2: health loop interval must be greater than zero")
 )
 
 type ClusterOption func(*clusterOptions)
@@ -256,7 +257,11 @@ func (c *Cluster) readerClient(forcePrimary bool) (*Client, error) {
 	}
 
 	// Fast path: write flag set — route to primary for read-after-write consistency.
-	if forcePrimary && c.primary != nil && c.primary.state == NodeStateReady {
+	if forcePrimary {
+		if c.primary == nil || c.primary.state != NodeStateReady {
+			c.mu.RUnlock()
+			return nil, errPrimaryUnavailable
+		}
 		client := c.primary.client
 		c.mu.RUnlock()
 		return client, nil
@@ -406,6 +411,46 @@ func (c *Cluster) Refresh(ctx context.Context) ClusterHealthReport {
 	return buildClusterReport(checkedAt, finalReports)
 }
 
+// RunHealthLoop periodically refreshes cluster health until ctx is canceled.
+// Callers should start it in their own goroutine to control shutdown semantics.
+func (c *Cluster) RunHealthLoop(ctx context.Context, interval time.Duration) error {
+	if interval <= 0 {
+		return errHealthLoopInterval
+	}
+
+	ctx = normalizeContext(ctx)
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	c.mu.RLock()
+	closed := c.closed
+	c.mu.RUnlock()
+	if closed {
+		return errClusterClosed
+	}
+
+	c.Refresh(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			c.mu.RLock()
+			closed = c.closed
+			c.mu.RUnlock()
+			if closed {
+				return errClusterClosed
+			}
+			c.Refresh(ctx)
+		}
+	}
+}
+
 func (c *Cluster) DrainReplica(name string, cause error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -441,6 +486,9 @@ func (c *Cluster) RecoverReplica(ctx context.Context, name string) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return errClusterClosed
+	}
 
 	// Topology changed while pinging — the node may have been promoted or removed.
 	if c.epoch != epochBefore {
@@ -459,6 +507,9 @@ func (c *Cluster) RecoverReplica(ctx context.Context, name string) error {
 	return nil
 }
 
+// MarkPrimaryDown 将当前主库标记为 down。
+// 注意：如果后续调用 Refresh() 且主库 Ping 恢复成功，状态会自动回到 Ready。
+// 如果你的目标是长期隔离主库，请在运维侧同时停止健康循环或避免继续触发 Refresh()。
 func (c *Cluster) MarkPrimaryDown(cause error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -473,6 +524,12 @@ func (c *Cluster) MarkPrimaryDown(cause error) error {
 	return nil
 }
 
+// SwitchPrimary 切换主库节点。
+// 注意：如果后续调用 Refresh() 且主库 Ping 恢复成功，状态会自动回到 Ready。
+// 如果你的目标是长期隔离主库，请在运维侧同时停止健康循环或避免继续触发 Refresh()。
+//
+// 注意：如果目标节点已经是主节点，则只做连通性确认；
+// 如果目标节点是副本节点，则把它提升为主节点。
 func (c *Cluster) SwitchPrimary(ctx context.Context, name string) (Node, error) {
 	c.mu.RLock()
 	if c.closed {
@@ -490,8 +547,9 @@ func (c *Cluster) SwitchPrimary(ctx context.Context, name string) (Node, error) 
 	return c.switchPrimaryPromote(ctx, name)
 }
 
-// switchPrimaryPingExisting handles the fast path of SwitchPrimary where the
-// requested node is already the primary. Caller must NOT hold any lock.
+// switchPrimaryPingExisting 处理 SwitchPrimary 的快路径：
+// 当目标节点已经是主节点时，只做连通性确认。
+// 调用方进入此函数前不能持有任何锁。
 func (c *Cluster) switchPrimaryPingExisting(ctx context.Context, name string) (Node, error) {
 	c.mu.RLock()
 	client := c.primary.client
@@ -500,6 +558,10 @@ func (c *Cluster) switchPrimaryPingExisting(ctx context.Context, name string) (N
 
 	if err := client.PingContext(ctx); err != nil {
 		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return Node{}, errClusterClosed
+		}
 		if c.epoch == epochBefore && c.primary != nil && c.primary.name == name {
 			c.primary.setState(NodeStateDown, err)
 		}
@@ -509,14 +571,22 @@ func (c *Cluster) switchPrimaryPingExisting(ctx context.Context, name string) (N
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.closed {
+		return Node{}, errClusterClosed
+	}
 	if c.primary != nil && c.primary.name == name {
 		return c.primary.snapshot(), nil
 	}
 	return Node{}, errTopologyChanged
 }
 
-// switchPrimaryPromote handles the slow path of SwitchPrimary where a replica
-// is promoted. Caller must hold RLock; this method releases it.
+// switchPrimaryPromote 处理 SwitchPrimary 的慢路径：
+// 当目标节点还是副本时，需要把它提升为主节点。
+//
+// 注意：调用方进入此函数时必须已经持有 RLock，
+// 且本函数会负责释放这把 RLock。
+// 这里特意保留这种锁交接方式，是为了在锁外执行 Ping，
+// 避免持锁做 I/O；后续维护这段代码时不要忽略这一点。
 func (c *Cluster) switchPrimaryPromote(ctx context.Context, name string) (Node, error) {
 	replica := c.findReplicaLocked(name)
 	if replica == nil {
@@ -530,6 +600,10 @@ func (c *Cluster) switchPrimaryPromote(ctx context.Context, name string) (Node, 
 	// Ping outside lock to avoid holding the mutex during I/O.
 	if err := client.PingContext(ctx); err != nil {
 		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return Node{}, errClusterClosed
+		}
 		if c.epoch == epochBefore {
 			if r := c.findReplicaLocked(name); r != nil {
 				r.setState(NodeStateDown, err)
@@ -541,6 +615,9 @@ func (c *Cluster) switchPrimaryPromote(ctx context.Context, name string) (Node, 
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return Node{}, errClusterClosed
+	}
 
 	// Re-check: topology may have changed during ping.
 	if c.epoch != epochBefore {

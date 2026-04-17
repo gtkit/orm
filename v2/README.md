@@ -17,10 +17,12 @@ go get github.com/gtkit/orm/v2
 - **并发安全** — epoch 机制防止 TOCTOU 竞态，所有共享状态锁内访问
 - **Trace ID 链路追踪** — `WithTraceIDExtractor` 将请求 ID 注入每条 SQL 日志
 - **健康检查 & 指标** — Ping 探活 + 10 项连接池指标，超时可配置
+- **自定义健康探针** — 可注入业务级 probe（`SELECT 1`、只读状态、复制延迟等）
 - **读写路由** — Round-robin 副本负载均衡，可回退主库，副本自动恢复
 - **读写一致性** — `ContextWithWriteFlag` 标记写后 context，后续读自动走主库，零额外开销
 - **显式拓扑切换** — 外部 HA 系统完成切换后，`SwitchPrimary()` 更新路由视图
 - **Replica 并行打开** — 集群初始化时并行连接所有副本，减少启动耗时
+- **启动期 Ping Retry** — 可选 backoff 重试，降低容器冷启动对数据库瞬时波动的敏感度
 
 ## 快速开始
 
@@ -51,6 +53,19 @@ if err != nil {
 defer client.Close()
 
 db := client.DB() // *gorm.DB
+```
+
+启动期如果希望容忍数据库短暂不可用，可开启 ping retry：
+
+```go
+client, err := orm.Open(
+    context.Background(),
+    orm.WithHost("127.0.0.1"),
+    orm.WithDatabase("orders"),
+    orm.WithUser("root"),
+    orm.WithPassword("secret"),
+    orm.WithStartupPingRetry(5, 200*time.Millisecond, 2*time.Second),
+)
 ```
 
 ### 集群模式
@@ -107,6 +122,7 @@ err := client.WithTx(ctx, nil, func(tx *gorm.DB) error {
 err := client.WithTx(ctx, nil, fn,
     orm.WithMaxRetries(5),
     orm.WithRetryBaseWait(10*time.Millisecond),
+    orm.WithRetryMaxWait(100*time.Millisecond),
 )
 
 // 禁用重试
@@ -120,6 +136,29 @@ err := client.WithReadTx(ctx, func(tx *gorm.DB) error {
 // 集群事务 — 写事务走主库，读事务走副本
 err := cluster.WithTx(ctx, func(tx *gorm.DB) error { ... })
 err := cluster.WithReadTx(ctx, func(tx *gorm.DB) error { ... })
+```
+
+如果你需要观测死锁重试次数、退避时长和触发点，可注入 observer：
+
+```go
+client, err := orm.Open(
+    ctx,
+    orm.WithTxRetryObserver(func(ctx context.Context, event orm.TxRetryEvent) {
+        metrics.ObserveDeadlockRetry(event.ClientName, event.Attempt, event.Wait)
+    }),
+)
+```
+
+`WithTx()` 回调内部如果发生 panic，库会先执行 `Rollback()`，再继续 `panic` 抛给调用方；调用方仍应在上层按自己的标准恢复或记录 panic。
+
+如果你希望限制单次退避上限，可使用：
+
+```go
+err := client.WithTx(ctx, nil, fn,
+    orm.WithMaxRetries(5),
+    orm.WithRetryBaseWait(10*time.Millisecond),
+    orm.WithRetryMaxWait(100*time.Millisecond),
+)
 ```
 
 ## 读写一致性保护
@@ -140,7 +179,17 @@ client, err := cluster.ReaderClientCtx(ctx)
 client.DB().WithContext(ctx).First(&order, orderID)
 ```
 
+如果当前请求上下文比较长，应使用窗口期或显式清除：
+
+```go
+ctx = orm.ContextWithWriteWindow(ctx, 2*time.Second)
+// 或者
+ctx = orm.ContextClearWriteFlag(ctx)
+```
+
 **性能影响：零。** 无 write flag 时 `ReaderClientCtx` 与 `ReaderClient` 耗时完全一致（~27ns），有 write flag 时反而更快（~15ns，跳过副本遍历）。
+
+注意：不要在 websocket、长轮询、消息消费等长生命周期 context 上长期保留 write flag，否则读流量会不知不觉全部压到主库。
 
 | 方法 | 适用场景 |
 |------|---------|
@@ -177,7 +226,51 @@ report := cluster.Refresh(ctx)     // 探测 + 更新节点状态
 metrics := cluster.Metrics()       // 所有节点指标
 ```
 
+业务进程可以显式启动后台健康循环：
+
+```go
+go func() {
+    if err := cluster.RunHealthLoop(ctx, 5*time.Second); err != nil {
+        logger.Error("cluster health loop exited", zap.Error(err))
+    }
+}()
+```
+
+优雅停机时，不要先 `cluster.Close()` 再等健康循环自己结束。推荐顺序是：
+
+1. 先 cancel 掉传给 `RunHealthLoop()` 的 `ctx`
+2. 等健康循环 goroutine 退出
+3. 再调用 `cluster.Close()`
+
+`RunHealthLoop()` 不会自行托管后台 goroutine 生命周期；它是显式阻塞循环，调用方应自己持有 `ctx` 和 goroutine 的退出同步。
+
+如果默认 `Ping()` 不够，可以叠加自定义探针：
+
+```go
+client, err := orm.Open(
+    ctx,
+    orm.WithHealthProbe(func(ctx context.Context, client *orm.Client, role orm.NodeRole) error {
+        if role == orm.RoleReplica {
+            return client.DB().WithContext(ctx).Exec("SELECT 1").Error
+        }
+        return nil
+    }),
+)
+```
+
+自定义 probe 适合做以下检查：
+
+- `SELECT 1`
+- 副本只读状态
+- 平台侧暴露的复制延迟 SQL / 视图
+- 业务约束要求的 readiness 校验
+
 指标列表：`orm_db_max_open_connections`, `orm_db_open_connections`, `orm_db_in_use_connections`, `orm_db_idle_connections`, `orm_db_wait_count_total`, `orm_db_wait_duration_seconds_total`, `orm_db_max_idle_closed_total`, `orm_db_max_idle_time_closed_total`, `orm_db_max_lifetime_closed_total`, `orm_db_connection_utilization`
+
+Prometheus / OpenTelemetry 参考实现：
+
+- [Prometheus 接入示例](../docs/prometheus-%E6%8E%A5%E5%85%A5%E7%A4%BA%E4%BE%8B.md)
+- [OpenTelemetry 接入示例](../docs/OpenTelemetry-%E6%8E%A5%E5%85%A5%E7%A4%BA%E4%BE%8B.md)
 
 ## 集成测试
 
@@ -218,6 +311,12 @@ cluster.MarkPrimaryDown(errors.New("write timeout"))
 // 外部 HA 完成切换后，更新应用路由
 cluster.SwitchPrimary(ctx, "replica-a")
 ```
+
+`MarkPrimaryDown()` 是一个临时运维状态：如果后续调用 `Refresh()` 且主库 Ping 恢复成功，状态会自动回到 `Ready`。  
+如果你的目标是长期隔离主库，请同时停止健康循环，或避免继续触发 `Refresh()`。
+
+**重要警告：** `SwitchPrimary()` 只更新 `Cluster` 内部路由视图，不会让你之前已经拿到的 `*Client` / `*gorm.DB` 自动失效。  
+切主完成后，必须重新调用 `Primary()`、`WriteClient()`、`ReaderClient()` 或 `ReaderClientCtx()` 重新取句柄；不要继续复用切主前缓存的写连接。
 
 ## 外部连接池包装
 
@@ -311,3 +410,9 @@ stats, _ := queries.GetDashboardStats(ctx)
 - 主从拓扑切换交给数据库平台或外部 HA 系统
 - 应用侧只负责连接管理、健康检查、读写路由和显式拓扑同步
 - `SwitchPrimary()` 只更新应用内路由视图，不修改数据库真实角色
+
+## 使用注意
+
+- `PrepareStmt=true` 配合读写分离时，要求主库和副本在 `sql_mode`、字符集、时区等会影响 prepare 行为的配置上保持一致；否则建议关闭 `PrepareStmt`
+- 本库输出的是通用 `MetricSample` 和 retry observer，不直接绑定 Prometheus / OpenTelemetry；如果你的监控体系要求 `prometheus.Collector` 或 span，请在接入层做适配
+- `Close()` 是立即关闭连接池，不等待外部已经拿到的查询自动排空；优雅停机请在应用层先停止流量，再关闭 `Cluster` / `Client`

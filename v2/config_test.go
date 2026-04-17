@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -132,5 +133,46 @@ func TestOpenWithoutStartupPingDoesNotDialImmediately(t *testing.T) {
 
 	if client.DB() == nil || client.SQLDB() == nil {
 		t.Fatalf("expected client to expose initialized db handles")
+	}
+}
+
+func TestOpenRetriesStartupPing(t *testing.T) {
+	sqlDB, state := newStubDB(withStubPingErrorOnce(context.DeadlineExceeded))
+	defer sqlDB.Close()
+
+	cfg := NewConfig(
+		WithStartupPingRetry(1, time.Millisecond, 5*time.Millisecond),
+		WithSkipInitializeWithVersion(true),
+	)
+
+	client, err := cfg.OpenWithDB(context.Background(), sqlDB)
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+	if client == nil {
+		t.Fatal("expected client")
+	}
+	if got := state.pingCount.Load(); got != 2 {
+		t.Fatalf("expected 2 startup pings, got %d", got)
+	}
+}
+
+func TestOpenClampsNegativeStartupPingRetries(t *testing.T) {
+	sqlDB, state := newStubDB(withStubPingError(context.DeadlineExceeded))
+	defer sqlDB.Close()
+
+	cfg := DefaultConfig()
+	cfg.StartupPingMaxRetries = -1
+	cfg.Dialect.SkipInitializeWithVersion = true
+
+	client, err := cfg.OpenWithDB(context.Background(), sqlDB)
+	if err == nil {
+		t.Fatalf("expected ping error, got client %#v", client)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+	if got := state.pingCount.Load(); got != 1 {
+		t.Fatalf("expected one startup ping, got %d", got)
 	}
 }

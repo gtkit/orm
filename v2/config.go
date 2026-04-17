@@ -26,6 +26,7 @@ const (
 	defaultConnMaxLifetime     = 30 * time.Minute
 	defaultConnMaxIdleTime     = 10 * time.Minute
 	defaultHealthCheckTimeout  = 5 * time.Second
+	defaultStartupPingRetryMax = 5 * time.Second
 )
 
 var (
@@ -34,12 +35,17 @@ var (
 )
 
 type Config struct {
-	Name        string
-	MySQL       MySQLConfig
-	Pool        PoolConfig
-	GORM        GORMConfig
-	Dialect     MySQLDialectConfig
-	StartupPing bool
+	Name                     string
+	MySQL                    MySQLConfig
+	Pool                     PoolConfig
+	GORM                     GORMConfig
+	Dialect                  MySQLDialectConfig
+	HealthProbe              HealthProbeFunc
+	TxRetryObserver          TxRetryObserver
+	StartupPing              bool
+	StartupPingMaxRetries    int
+	StartupPingRetryBaseWait time.Duration
+	StartupPingRetryMaxWait  time.Duration
 }
 
 // MySQLConfig describes driver-level connection settings.
@@ -151,7 +157,10 @@ func DefaultConfig() Config {
 		GORM: GORMConfig{
 			NamingStrategy: defaultNamingStrategy(),
 		},
-		StartupPing: true,
+		StartupPing:              true,
+		StartupPingMaxRetries:    0,
+		StartupPingRetryBaseWait: time.Second,
+		StartupPingRetryMaxWait:  defaultStartupPingRetryMax,
 	}
 }
 
@@ -280,7 +289,7 @@ func (c Config) openWithSQLDB(
 	applyPoolConfig(sqlDB, clone.Pool)
 
 	if clone.StartupPing {
-		if err := sqlDB.PingContext(normalizeContext(ctx)); err != nil {
+		if err := pingWithRetry(normalizeContext(ctx), sqlDB, clone); err != nil {
 			return nil, err
 		}
 	}
@@ -296,6 +305,31 @@ func (c Config) openWithSQLDB(
 		config:    clone,
 		ownsSQLDB: ownsSQLDB,
 	}, nil
+}
+
+func pingWithRetry(ctx context.Context, sqlDB *sql.DB, cfg Config) error {
+	var lastErr error
+	maxRetries := cfg.StartupPingMaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	for attempt := range maxRetries + 1 {
+		lastErr = sqlDB.PingContext(ctx)
+		if lastErr == nil {
+			return nil
+		}
+		if attempt >= maxRetries {
+			return lastErr
+		}
+
+		sleep := retryBackoff(attempt, cfg.StartupPingRetryBaseWait, cfg.StartupPingRetryMaxWait)
+		select {
+		case <-ctx.Done():
+			return errors.Join(lastErr, ctx.Err())
+		case <-time.After(sleep):
+		}
+	}
+	return lastErr
 }
 
 func (c Config) gormConfig() *gorm.Config {

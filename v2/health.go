@@ -44,6 +44,8 @@ type MetricSample struct {
 	Labels map[string]string
 }
 
+type HealthProbeFunc func(ctx context.Context, client *Client, role NodeRole) error
+
 type HealthReport struct {
 	Name      string
 	Role      NodeRole
@@ -100,6 +102,12 @@ func (c *Client) healthCheck(ctx context.Context, name string, role NodeRole) He
 		report.Status = HealthStatusDown
 		report.State = NodeStateDown
 		report.Error = err
+	} else if c.config.HealthProbe != nil {
+		if probeErr := c.config.HealthProbe(ctx, c, role); probeErr != nil {
+			report.Status = HealthStatusDown
+			report.State = NodeStateDown
+			report.Error = probeErr
+		}
 	}
 
 	report.Duration = time.Since(start)
