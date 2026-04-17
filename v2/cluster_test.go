@@ -426,7 +426,9 @@ func TestClusterHealthCheckAcceptsNilContext(t *testing.T) {
 		t.Fatalf("NewCluster() error = %v", err)
 	}
 
-	report := cluster.HealthCheck(nil)
+	var nilCtx context.Context
+
+	report := cluster.HealthCheck(nilCtx)
 	if report.Status != HealthStatusUp {
 		t.Fatalf("expected up cluster status, got %q", report.Status)
 	}
@@ -449,7 +451,9 @@ func TestClusterRefreshAcceptsNilContext(t *testing.T) {
 		t.Fatalf("NewCluster() error = %v", err)
 	}
 
-	report := cluster.Refresh(nil)
+	var nilCtx context.Context
+
+	report := cluster.Refresh(nilCtx)
 	if report.Status != HealthStatusUp {
 		t.Fatalf("expected up cluster status, got %q", report.Status)
 	}

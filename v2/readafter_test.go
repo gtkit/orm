@@ -1,16 +1,23 @@
 package orm
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestContextWithWriteFlagAcceptsNilContext(t *testing.T) {
-	ctx := ContextWithWriteFlag(nil)
+	var nilCtx context.Context
+
+	ctx := ContextWithWriteFlag(nilCtx)
 	if !HasWriteFlag(ctx) {
 		t.Fatal("expected write flag on returned context")
 	}
 }
 
 func TestHasWriteFlagReturnsFalseForNilContext(t *testing.T) {
-	if HasWriteFlag(nil) {
+	var nilCtx context.Context
+
+	if HasWriteFlag(nilCtx) {
 		t.Fatal("expected false for nil context")
 	}
 }

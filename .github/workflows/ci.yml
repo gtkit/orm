@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  root-checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Lint Root Module
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.4
+          args: --config=.golangci.yml ./...
+
+      - name: Add Go Bin To PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Test Root Module
+        run: go test ./...
+
+      - name: Race Test Root Module
+        run: go test -race ./...
+
+      - name: Vet Root Module
+        run: go vet ./...
+
+      - name: Vulnerability Scan Root Module
+        run: govulncheck ./...
+
+  v2-checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: v2/go.mod
+
+      - name: Lint v2 Module
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.4
+          working-directory: v2
+          args: --config=../.golangci.yml ./...
+
+      - name: Add Go Bin To PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Test v2 Module
+        working-directory: v2
+        run: go test ./...
+
+      - name: Race Test v2 Module
+        working-directory: v2
+        run: go test -race ./...
+
+      - name: Vet v2 Module
+        working-directory: v2
+        run: go vet ./...
+
+      - name: Vulnerability Scan v2 Module
+        working-directory: v2
+        run: govulncheck ./...
+
+  v2-integration:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: v2/go.mod
+
+      - name: Run v2 Integration Tests
+        working-directory: v2
+        env:
+          ORM_RUN_INTEGRATION: "1"
+          ORM_TEST_DSN: root:root@tcp(127.0.0.1:3306)/
+        run: go test -run Integration ./...

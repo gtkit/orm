@@ -67,8 +67,8 @@ func TestMysqlConfigBuildsDriverDSN(t *testing.T) {
 	if cfg.Timeout != defaultDialTimeout {
 		t.Fatalf("expected timeout %v, got %v", defaultDialTimeout, cfg.Timeout)
 	}
-	if !strings.Contains(dsn, "charset=utf8mb4") {
-		t.Fatalf("expected dsn to include charset, got %q", dsn)
+	if strings.Contains(dsn, "charset=") {
+		t.Fatalf("expected dsn to avoid charset param, got %q", dsn)
 	}
 	if !strings.Contains(dsn, "/app%2Fmain") {
 		t.Fatalf("expected db name to be path-escaped, got %q", dsn)

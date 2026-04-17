@@ -179,6 +179,30 @@ metrics := cluster.Metrics()       // 所有节点指标
 
 指标列表：`orm_db_max_open_connections`, `orm_db_open_connections`, `orm_db_in_use_connections`, `orm_db_idle_connections`, `orm_db_wait_count_total`, `orm_db_wait_duration_seconds_total`, `orm_db_max_idle_closed_total`, `orm_db_max_idle_time_closed_total`, `orm_db_max_lifetime_closed_total`, `orm_db_connection_utilization`
 
+## 集成测试
+
+`v2` 提供了真实 MySQL 集成测试，默认不会在普通 `go test ./...` 中连接数据库；只有显式设置环境变量时才会执行。
+
+本地运行示例：
+
+```bash
+cd v2
+ORM_TEST_DSN='root:root@tcp(127.0.0.1:3306)/' make integration
+```
+
+Lint 需使用 `golangci-lint` v2；仓库根目录的 `.golangci-lint-version` 已固定当前 CI 版本。
+
+环境变量说明：
+
+- `ORM_RUN_INTEGRATION=1`：开启真实数据库集成测试
+- `ORM_TEST_DSN`：指向 MySQL 实例的基础 DSN，建议不要固定 schema；测试会自动创建并清理临时数据库
+
+当前集成测试覆盖：
+
+- `Config.Open()` + GORM 实际建表/读写
+- `Cluster.WithReadTx()` 在 write flag 下回主库
+- `SwitchPrimary()` 后的真实写路由切换
+
 ## 运维操作
 
 ```go

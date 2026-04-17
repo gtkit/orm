@@ -230,9 +230,6 @@ func buildMySQLDriverConfig(opt options) *mysqldriver.Config {
 	cfg.Timeout = defaultDialTimeout
 	cfg.ReadTimeout = defaultReadTimeout
 	cfg.WriteTimeout = defaultWriteTimeout
-	cfg.Params = map[string]string{
-		"charset": "utf8mb4",
-	}
 	return cfg
 }
 

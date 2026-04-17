@@ -137,9 +137,6 @@ func DefaultConfig() Config {
 			ReadTimeout:  defaultReadTimeout,
 			WriteTimeout: defaultWriteTimeout,
 			ParseTime:    true,
-			Params: map[string]string{
-				"charset": "utf8mb4",
-			},
 		},
 		Pool: PoolConfig{
 			MaxOpenConns:       defaultMaxOpenConns,

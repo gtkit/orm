@@ -1,6 +1,19 @@
-.PHONY: tool check tag gittag
+.PHONY: test test-race vet integration tool check ci tag gittag
 
 LINT_TARGETS ?= ./...
+
+test:
+	go test ./...
+
+test-race:
+	go test -race ./...
+
+vet:
+	go vet ./...
+
+integration:
+	@test -n "$$ORM_TEST_DSN" || (echo "❌ set ORM_TEST_DSN"; exit 1)
+	ORM_RUN_INTEGRATION=1 go test -run Integration ./...
 
 tool: ## Lint Go code with the installed golangci-lint
 	@ echo "▶️  golangci-lint run (v2)"
@@ -11,6 +24,8 @@ tool: ## Lint Go code with the installed golangci-lint
 ## govulncheck 检查漏洞 go install golang.org/x/vuln/cmd/govulncheck@latest
 check:
 	govulncheck ./...
+
+ci: tool test test-race vet check
 
 ## ────────────────────────────────────────────────────────
 ## v2 发版: make tag

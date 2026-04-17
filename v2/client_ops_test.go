@@ -149,7 +149,9 @@ func TestClientHealthCheckAcceptsNilContext(t *testing.T) {
 		t.Fatalf("OpenWithDB() error = %v", err)
 	}
 
-	report := client.HealthCheck(nil)
+	var nilCtx context.Context
+
+	report := client.HealthCheck(nilCtx)
 	if report.Status != HealthStatusUp {
 		t.Fatalf("expected health up, got %q", report.Status)
 	}

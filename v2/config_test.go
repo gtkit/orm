@@ -40,8 +40,8 @@ func TestDriverConfigAndRedactedDSN(t *testing.T) {
 	if driverCfg.WriteTimeout != 4*time.Second {
 		t.Fatalf("expected write timeout 4s, got %v", driverCfg.WriteTimeout)
 	}
-	if got := driverCfg.Params["charset"]; got != "utf8mb4" {
-		t.Fatalf("expected charset utf8mb4, got %q", got)
+	if _, ok := driverCfg.Params["charset"]; ok {
+		t.Fatalf("expected charset param to be omitted, got %#v", driverCfg.Params)
 	}
 
 	dsn, err := cfg.RedactedDSN()
@@ -59,13 +59,13 @@ func TestDriverConfigAndRedactedDSN(t *testing.T) {
 func TestConfigCloneIsIsolated(t *testing.T) {
 	base := DefaultConfig()
 	clone := base.With(WithDSNParam("readPreference", "secondary"))
-	clone.MySQL.Params["charset"] = "latin1"
+	clone.MySQL.Params["readPreference"] = "primary"
 
-	if got := base.MySQL.Params["charset"]; got != "utf8mb4" {
-		t.Fatalf("expected original charset utf8mb4, got %q", got)
-	}
 	if _, ok := base.MySQL.Params["readPreference"]; ok {
 		t.Fatalf("expected original params to stay isolated")
+	}
+	if got := clone.MySQL.Params["readPreference"]; got != "primary" {
+		t.Fatalf("expected clone param update to stay local, got %q", got)
 	}
 }
 
