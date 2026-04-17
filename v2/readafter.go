@@ -17,12 +17,15 @@ const ctxKeyWriteFlag ctxKey = iota
 //	ctx = orm.ContextWithWriteFlag(ctx)
 //	// subsequent reads via ReaderClientCtx(ctx) will hit the primary
 func ContextWithWriteFlag(ctx context.Context) context.Context {
-	return context.WithValue(ctx, ctxKeyWriteFlag, true)
+	return context.WithValue(normalizeContext(ctx), ctxKeyWriteFlag, true)
 }
 
 // HasWriteFlag reports whether the context carries a write flag
 // set by [ContextWithWriteFlag].
 func HasWriteFlag(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
 	v, _ := ctx.Value(ctxKeyWriteFlag).(bool)
 	return v
 }

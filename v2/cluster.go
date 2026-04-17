@@ -360,7 +360,7 @@ func (c *Cluster) WithTx(ctx context.Context, fn func(tx *gorm.DB) error, txOpts
 }
 
 func (c *Cluster) WithReadTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	client, err := c.ReaderClient()
+	client, err := c.ReaderClientCtx(ctx)
 	if err != nil {
 		return err
 	}
@@ -842,6 +842,8 @@ func (c *Cluster) healthCtx(ctx context.Context) (context.Context, context.Cance
 	c.mu.RLock()
 	timeout := c.options.healthCheckTimeout
 	c.mu.RUnlock()
+
+	ctx = normalizeContext(ctx)
 
 	if timeout <= 0 {
 		return ctx, func() {}

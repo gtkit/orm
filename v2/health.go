@@ -76,6 +76,8 @@ func (c *Client) Metrics() []MetricSample {
 }
 
 func (c *Client) healthCheck(ctx context.Context, name string, role NodeRole) HealthReport {
+	ctx = normalizeContext(ctx)
+
 	// Apply a default timeout if the caller did not set a deadline,
 	// preventing health checks from blocking indefinitely.
 	if _, ok := ctx.Deadline(); !ok {

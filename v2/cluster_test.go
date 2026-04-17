@@ -87,6 +87,39 @@ func TestClusterWithTxAndReadTx(t *testing.T) {
 	}
 }
 
+func TestClusterWithReadTxRoutesToPrimaryOnWriteFlag(t *testing.T) {
+	primaryDB, primaryState := newStubDB()
+	defer primaryDB.Close()
+	replicaDB, replicaState := newStubDB()
+	defer replicaDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	replica, err := OpenWithDB(context.Background(), replicaDB, WithName("replica"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open replica: %v", err)
+	}
+
+	cluster, err := NewCluster(primary, replica)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	ctx := ContextWithWriteFlag(context.Background())
+	if txErr := cluster.WithReadTx(ctx, func(_ *gorm.DB) error { return nil }); txErr != nil {
+		t.Fatalf("cluster WithReadTx() error = %v", txErr)
+	}
+
+	if got := primaryState.readOnlyCount.Load(); got != 1 {
+		t.Fatalf("expected primary read-only begin count 1, got %d", got)
+	}
+	if got := replicaState.readOnlyCount.Load(); got != 0 {
+		t.Fatalf("expected replica read-only begin count 0, got %d", got)
+	}
+}
+
 func TestDrainAndRecoverReplica(t *testing.T) {
 	primaryDB, _ := newStubDB()
 	defer primaryDB.Close()
@@ -376,6 +409,52 @@ func TestClusterHealthCheckDownWhenPrimaryDown(t *testing.T) {
 	}
 	if report.Healthy() {
 		t.Fatalf("expected unhealthy cluster report")
+	}
+}
+
+func TestClusterHealthCheckAcceptsNilContext(t *testing.T) {
+	primaryDB, primaryState := newStubDB()
+	defer primaryDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+
+	cluster, err := NewCluster(primary)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	report := cluster.HealthCheck(nil)
+	if report.Status != HealthStatusUp {
+		t.Fatalf("expected up cluster status, got %q", report.Status)
+	}
+	if got := primaryState.pingCount.Load(); got != 1 {
+		t.Fatalf("expected primary ping count 1, got %d", got)
+	}
+}
+
+func TestClusterRefreshAcceptsNilContext(t *testing.T) {
+	primaryDB, primaryState := newStubDB()
+	defer primaryDB.Close()
+
+	primary, err := OpenWithDB(context.Background(), primaryDB, WithName("primary"), WithStartupPing(false), WithSkipInitializeWithVersion(true))
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+
+	cluster, err := NewCluster(primary)
+	if err != nil {
+		t.Fatalf("NewCluster() error = %v", err)
+	}
+
+	report := cluster.Refresh(nil)
+	if report.Status != HealthStatusUp {
+		t.Fatalf("expected up cluster status, got %q", report.Status)
+	}
+	if got := primaryState.pingCount.Load(); got != 1 {
+		t.Fatalf("expected primary ping count 1, got %d", got)
 	}
 }
 

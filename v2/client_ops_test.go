@@ -135,6 +135,29 @@ func TestClientHealthCheckDown(t *testing.T) {
 	}
 }
 
+func TestClientHealthCheckAcceptsNilContext(t *testing.T) {
+	sqlDB, state := newStubDB()
+	defer sqlDB.Close()
+
+	client, err := OpenWithDB(
+		context.Background(),
+		sqlDB,
+		WithStartupPing(false),
+		WithSkipInitializeWithVersion(true),
+	)
+	if err != nil {
+		t.Fatalf("OpenWithDB() error = %v", err)
+	}
+
+	report := client.HealthCheck(nil)
+	if report.Status != HealthStatusUp {
+		t.Fatalf("expected health up, got %q", report.Status)
+	}
+	if got := state.pingCount.Load(); got != 1 {
+		t.Fatalf("expected one health-check ping, got %d", got)
+	}
+}
+
 func TestWithTxRetriesOnDeadlock(t *testing.T) {
 	mysqlDeadlock := &mysqldriver.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
 
